@@ -412,16 +412,19 @@ impl SampleGenerator {
                 0,
                 0,
                 0,
-                Some(&frame_texture.cast::<ID3D11Resource>()?), // Use .cast() from ComInterface trait
+                &*frame_texture,
                 0,
                 Some(&region),
             );
 
+            // Process our back buffer
             self.video_processor
                 .process_texture(&self.compose_texture)?;
 
+            // Get our NV12 texture
             let video_output_texture = self.video_processor.output_texture();
 
+            // Make a copy for the sample
             let desc = {
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 video_output_texture.GetDesc(&mut desc);
@@ -433,10 +436,8 @@ impl SampleGenerator {
                     .CreateTexture2D(&desc, None, Some(&mut texture))?;
                 texture.unwrap()
             };
-            self.d3d_context.CopyResource(
-                Some(&sample_texture.cast::<ID3D11Resource>()?), // Use .cast() from ComInterface trait
-                Some(&video_output_texture.cast::<ID3D11Resource>()?), // Use .cast() from ComInterface trait
-            );
+            self.d3d_context
+                .CopyResource(&sample_texture, video_output_texture);
 
             Ok(VideoEncoderInputSample::new(relative_timestamp, sample_texture))
         }

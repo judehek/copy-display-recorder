@@ -7,9 +7,7 @@ use windows::{
         Graphics::{
             Direct3D11::{ID3D11Device, ID3D11Texture2D},
             Dxgi::{
-                IDXGIAdapter1, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
-                IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT,
-                DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, DXGI_RESOURCE_PRIORITY_MAXIMUM,
+                IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, DXGI_RESOURCE_PRIORITY_MAXIMUM
             },
             Gdi::HMONITOR,
         },
@@ -34,16 +32,10 @@ fn get_dxgi_output_from_hmonitor(
         }
     };
     
-    let adapter: IDXGIAdapter1 = match unsafe { dxgi_device.GetAdapter() } {
-        Ok(adapter_base) => match adapter_base.cast() {
-            Ok(adapter) => {
-                println!("Successfully got IDXGIAdapter1");
-                adapter
-            },
-            Err(e) => {
-                println!("Failed to cast to IDXGIAdapter1: {:?}", e);
-                return Err(e);
-            }
+    let adapter: IDXGIAdapter = match unsafe { dxgi_device.GetAdapter() } {
+        Ok(adapter) => {
+            println!("Successfully got IDXGIAdapter");
+            adapter
         },
         Err(e) => {
             println!("Failed to get adapter: {:?}", e);
