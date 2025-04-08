@@ -39,7 +39,7 @@ pub fn create_d3d_device() -> Result<ID3D11Device> {
     let mut device = None;
     let flags = {
         let mut flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-        if cfg!(feature = "d3ddebug") {
+        if true {
             flags |= D3D11_CREATE_DEVICE_DEBUG;
         }
         flags

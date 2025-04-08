@@ -8,9 +8,7 @@ use windows::{
     Win32::{
         Graphics::{
             Direct3D11::{
-                ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Resource, // Import ID3D11Resource
-                ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-                D3D11_BOX, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+                ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Resource, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING
             },
             Dxgi::{
                 Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC},
@@ -374,8 +372,8 @@ impl SampleGenerator {
         frame: &AcquiredFrame,
     ) -> Result<VideoEncoderInputSample> {
         let frame_qpc_time = frame.frame_info.LastPresentTime;
-        let timestamp = convert_qpc_to_timespan(frame_qpc_time)?; // Call the helper function
-
+        let timestamp = convert_qpc_to_timespan(frame_qpc_time)?;
+    
         if !self.seen_first_time_stamp {
             self.first_timestamp = timestamp;
             self.seen_first_time_stamp = true;
@@ -383,17 +381,117 @@ impl SampleGenerator {
         let relative_timestamp = TimeSpan {
             Duration: timestamp.Duration - self.first_timestamp.Duration,
         };
-
+    
         let frame_texture = &frame.texture;
         let desc = unsafe {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             frame_texture.GetDesc(&mut desc);
             desc
         };
-
+    
         let width = desc.Width;
         let height = desc.Height;
-
+    
+        // Add debug code to check pixel values
+        unsafe {
+            // Create a staging texture to read from GPU
+            let staging_desc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: desc.Format,
+                SampleDesc: desc.SampleDesc,
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            
+            let mut staging_texture = None;
+            self.d3d_device.CreateTexture2D(&staging_desc, None, Some(&mut staging_texture))?;
+            let staging_texture = staging_texture.unwrap();
+            
+            // Copy the frame texture to the staging texture
+            self.d3d_context.CopyResource(&staging_texture, &*frame_texture);
+            
+            // Map the staging texture to read the data
+            let mut mapped_resource = D3D11_MAPPED_SUBRESOURCE::default();
+            self.d3d_context.Map(
+                &staging_texture,
+                0,
+                D3D11_MAP_READ,
+                0,
+                Some(&mut mapped_resource),
+            )?;
+            
+            // Print pixel values at various positions
+            println!("Frame dimensions: {}x{}, Format: {:?}", width, height, desc.Format);
+            
+            let pixel_data = mapped_resource.pData as *const u8;
+            let row_pitch = mapped_resource.RowPitch;
+            
+            // Print format information first
+            println!("Format: {:?}, Row pitch: {}", desc.Format, row_pitch);
+            
+            // Sample pixels at different locations regardless of format
+            // Just print raw bytes for now since we don't know the exact format
+            
+            // Top-left corner
+            let bytes_per_pixel = match desc.Format {
+                // Add common formats - you can expand this list
+                format if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM => 4,
+                format if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM => 4,
+                format if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT => 8,
+                _ => {
+                    println!("Unknown format: {:?}, assuming 4 bytes per pixel", desc.Format);
+                    4 // Default assumption
+                }
+            };
+            
+            // Top-left pixel
+            println!("Top-left pixel raw bytes:");
+            for i in 0..bytes_per_pixel {
+                print!("{:02X} ", *pixel_data.add(i));
+            }
+            println!();
+            
+            // Center pixel
+            let center_x = width / 2;
+            let center_y = height / 2;
+            let offset_center = (center_y * row_pitch as u32 + center_x * bytes_per_pixel as u32) as usize;
+            println!("Center pixel raw bytes:");
+            for i in 0..bytes_per_pixel {
+                print!("{:02X} ", *pixel_data.add(offset_center + i));
+            }
+            println!();
+            
+            // Bottom-right pixel
+            let offset_br = ((height - 1) * row_pitch as u32 + (width - 1) * bytes_per_pixel as u32) as usize;
+            println!("Bottom-right pixel raw bytes:");
+            for i in 0..bytes_per_pixel {
+                print!("{:02X} ", *pixel_data.add(offset_br + i));
+            }
+            println!();
+            
+            // Simple check for black frame
+            let is_black = |offset: usize| -> bool {
+                // Just check if the first few bytes are close to zero
+                // This is a rough check that should work for most formats
+                let sum: u32 = (0..bytes_per_pixel.min(3))
+                    .map(|i| *pixel_data.add(offset + i) as u32)
+                    .sum();
+                sum < 15 // If sum of first 3 color channels is less than 15, consider it black
+            };
+            
+            if is_black(0) && is_black(offset_center) && is_black(offset_br) {
+                println!("WARNING: Frame appears to be mostly black at capture level!");
+            }
+            
+            // Unmap the resource when done
+            self.d3d_context.Unmap(&staging_texture, 0);
+        }
+    
         let region = D3D11_BOX {
             left: 0,
             right: width,
@@ -402,7 +500,7 @@ impl SampleGenerator {
             back: 1,
             front: 0,
         };
-
+    
         unsafe {
             self.d3d_context
                 .ClearRenderTargetView(&self.render_target_view, &CLEAR_COLOR);
@@ -416,14 +514,14 @@ impl SampleGenerator {
                 0,
                 Some(&region),
             );
-
+    
             // Process our back buffer
             self.video_processor
                 .process_texture(&self.compose_texture)?;
-
+    
             // Get our NV12 texture
             let video_output_texture = self.video_processor.output_texture();
-
+    
             // Make a copy for the sample
             let desc = {
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
@@ -438,7 +536,7 @@ impl SampleGenerator {
             };
             self.d3d_context
                 .CopyResource(&sample_texture, video_output_texture);
-
+    
             Ok(VideoEncoderInputSample::new(relative_timestamp, sample_texture))
         }
     }
