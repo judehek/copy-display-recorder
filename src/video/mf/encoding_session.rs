@@ -97,25 +97,50 @@ impl MFVideoEncodingSession {
         frame_rate: u32,
         stream: IRandomAccessStream,
     ) -> Result<Self> {
+        println!("Starting MFVideoEncodingSession::new");
         let input_size = ensure_even_size(resolution);
         let output_size = ensure_even_size(resolution);
-
-        let mut video_encoder = VideoEncoder::new(
+        println!("Input size: {}x{}, Output size: {}x{}", 
+                 input_size.Width, input_size.Height, 
+                 output_size.Width, output_size.Height);
+    
+        println!("Creating VideoEncoder");
+        let mut video_encoder = match VideoEncoder::new(
             encoder_device,
             d3d_device.clone(),
             output_size,
             output_size,
             bit_rate,
             frame_rate,
-        )?;
+        ) {
+            Ok(encoder) => {
+                println!("VideoEncoder created successfully");
+                encoder
+            },
+            Err(e) => {
+                println!("Failed to create VideoEncoder: {:?} - {}", e.code(), e.message());
+                return Err(e);
+            }
+        };
+        
         let output_type = video_encoder.output_type().clone();
-
-        let mut sample_generator = SampleGenerator::new(
+    
+        println!("Creating SampleGenerator");
+        let mut sample_generator = match SampleGenerator::new(
             d3d_device.clone(),
             monitor_handle,
             input_size,
             output_size,
-        )?;
+        ) {
+            Ok(generator) => {
+                println!("SampleGenerator created successfully");
+                generator
+            },
+            Err(e) => {
+                println!("Failed to create SampleGenerator: {:?} - {}", e.code(), e.message());
+                return Err(e);
+            }
+        };
 
         video_encoder.set_sample_requested_callback(
             move || -> Result<Option<VideoEncoderInputSample>> { sample_generator.generate() },
@@ -189,16 +214,42 @@ impl SampleGenerator {
         input_size: SizeInt32,
         output_size: SizeInt32,
     ) -> Result<Self> {
-        let d3d_context = unsafe { d3d_device.GetImmediateContext()? };
-
-        let video_processor = VideoProcessor::new(
+        println!("SampleGenerator::new starting...");
+        println!("Input size: {}x{}, Output size: {}x{}", 
+            input_size.Width, input_size.Height, 
+            output_size.Width, output_size.Height);
+        
+        println!("Getting D3D context...");
+        let d3d_context = match unsafe { d3d_device.GetImmediateContext() } {
+            Ok(context) => {
+                println!("Successfully got D3D context");
+                context
+            },
+            Err(e) => {
+                println!("Failed to get D3D context: {:?} - {}", e.code(), e.message());
+                return Err(e);
+            }
+        };
+    
+        println!("Creating VideoProcessor...");
+        let video_processor = match VideoProcessor::new(
             d3d_device.clone(),
             DXGI_FORMAT_B8G8R8A8_UNORM,
             input_size,
             DXGI_FORMAT_NV12,
             output_size,
-        )?;
-
+        ) {
+            Ok(processor) => {
+                println!("Successfully created VideoProcessor");
+                processor
+            },
+            Err(e) => {
+                println!("Failed to create VideoProcessor: {:?} - {}", e.code(), e.message());
+                return Err(e);
+            }
+        };
+    
+        println!("Creating compose texture...");
         let texture_desc = D3D11_TEXTURE2D_DESC {
             Width: input_size.Width as u32,
             Height: input_size.Height as u32,
@@ -213,27 +264,70 @@ impl SampleGenerator {
             BindFlags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
             ..Default::default()
         };
-        let compose_texture = unsafe {
+        
+        println!("Texture description: Width={}, Height={}, Format={:?}, BindFlags={:x}",
+            texture_desc.Width, texture_desc.Height, texture_desc.Format, texture_desc.BindFlags);
+        
+        let compose_texture = match unsafe {
             let mut texture = None;
-            d3d_device.CreateTexture2D(&texture_desc, None, Some(&mut texture))?;
-            texture.unwrap()
+            let result = d3d_device.CreateTexture2D(&texture_desc, None, Some(&mut texture));
+            if result.is_ok() {
+                println!("Successfully created texture");
+                Ok(texture.unwrap())
+            } else {
+                println!("Failed to create texture: {:?}", result);
+                Err(result.unwrap_err())
+            }
+        } {
+            Ok(texture) => texture,
+            Err(e) => {
+                println!("Error creating compose texture: {:?} - {}", e.code(), e.message());
+                return Err(e);
+            }
         };
-        let render_target_view = unsafe {
+    
+        println!("Creating render target view...");
+        let render_target_view = match unsafe {
             let mut rtv = None;
-            d3d_device.CreateRenderTargetView(&compose_texture, None, Some(&mut rtv))?;
-            rtv.unwrap()
+            let result = d3d_device.CreateRenderTargetView(&compose_texture, None, Some(&mut rtv));
+            if result.is_ok() {
+                println!("Successfully created render target view");
+                Ok(rtv.unwrap())
+            } else {
+                println!("Failed to create render target view: {:?}", result);
+                Err(result.unwrap_err())
+            }
+        } {
+            Ok(view) => view,
+            Err(e) => {
+                println!("Error creating render target view: {:?} - {}", e.code(), e.message());
+                return Err(e);
+            }
         };
-
-        let frame_generator = CaptureFrameGenerator::new(d3d_device.clone(), monitor_handle)?;
+    
+        println!("Creating CaptureFrameGenerator...");
+        let frame_generator = match CaptureFrameGenerator::new(d3d_device.clone(), monitor_handle) {
+            Ok(generator) => {
+                println!("Successfully created CaptureFrameGenerator");
+                generator
+            },
+            Err(e) => {
+                println!("Failed to create CaptureFrameGenerator: {:?} - {}", e.code(), e.message());
+                return Err(e);
+            }
+        };
+        
         let (gen_width, gen_height) = frame_generator.resolution();
-
+        println!("Frame generator resolution: {}x{}", gen_width, gen_height);
+    
         if input_size.Width as u32 != gen_width || input_size.Height as u32 != gen_height {
             eprintln!(
                 "Warning: Specified input size ({}, {}) does not match monitor resolution ({}, {}). Using monitor resolution.",
                 input_size.Width, input_size.Height, gen_width, gen_height
             );
         }
-
+    
+        println!("SampleGenerator::new completed successfully");
         Ok(Self {
             d3d_device,
             d3d_context,
