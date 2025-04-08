@@ -5,7 +5,7 @@ use windows::{
     Win32::{
         Foundation::RECT,
         Graphics::{
-            Direct3D11::{ID3D11Device, ID3D11Texture2D},
+            Direct3D11::{ID3D11Device, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING},
             Dxgi::{
                 IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, DXGI_RESOURCE_PRIORITY_MAXIMUM
             },
@@ -13,6 +13,15 @@ use windows::{
         },
     },
 };
+
+
+pub struct FrameAnalysisResult {
+    pub is_black: bool,
+    pub non_black_percentage: f32,
+    pub max_brightness: u8,
+    pub sample_pixels: Vec<(u32, u32, [u8; 3])>, // Coordinates and RGB values
+    pub analyzed_pixels: u32,
+}
 
 // Helper function to get IDXGIOutput1 from HMONITOR
 fn get_dxgi_output_from_hmonitor(
@@ -89,9 +98,8 @@ pub struct AcquiredFrame {
 }
 
 pub struct CaptureFrameGenerator {
-    _d3d_device: ID3D11Device, // Keep the device alive
+    _d3d_device: ID3D11Device,
     duplication: IDXGIOutputDuplication,
-    buffer_texture: Option<ID3D11Texture2D>, // Reusable texture for copying
     width: u32,
     height: u32,
 }
@@ -134,7 +142,6 @@ impl CaptureFrameGenerator {
         Ok(Self {
             _d3d_device: d3d_device,
             duplication,
-            buffer_texture: None,
             width,
             height,
         })
@@ -166,6 +173,20 @@ impl CaptureFrameGenerator {
                 println!("Got desktop resource, casting to ID3D11Texture2D");
                 
                 let texture: ID3D11Texture2D = desktop_resource.cast()?;
+                match self.analyze_frame(&texture) {
+                    Ok(analysis) => {
+                        println!("Frame analysis: black={}, non-black pixels={:.2}%, max brightness={}", 
+                            analysis.is_black, analysis.non_black_percentage, analysis.max_brightness);
+                        
+                        if !analysis.is_black && !analysis.sample_pixels.is_empty() {
+                            println!("Sample non-black pixels:");
+                            for (i, (x, y, rgb)) in analysis.sample_pixels.iter().enumerate().take(5) {
+                                println!("  Pixel {}: ({}, {}) RGB={:?}", i, x, y, rgb);
+                            }
+                        }
+                    },
+                    Err(e) => println!("Error analyzing frame: {:?}", e),
+                }
                 println!("Successfully cast resource to texture");
                 
                 // Release the frame immediately after getting the texture
@@ -192,6 +213,130 @@ impl CaptureFrameGenerator {
                 Err(err.into()) // Other errors
             }
         }
+    }
+    
+    pub fn analyze_frame(&self, texture: &ID3D11Texture2D) -> Result<FrameAnalysisResult> {
+        // Get the D3D11 device and immediate context
+        let device = &self._d3d_device;
+        let context = unsafe { device.GetImmediateContext() }.unwrap();
+    
+        // Create a staging texture that we can read from CPU
+        let mut texture_desc = unsafe { std::mem::zeroed::<D3D11_TEXTURE2D_DESC>() };
+        unsafe { texture.GetDesc(&mut texture_desc) };
+        
+        // Modify the description for our staging texture
+        texture_desc.Usage = D3D11_USAGE_STAGING;
+        texture_desc.BindFlags = 0;
+        texture_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        texture_desc.MiscFlags = 0;
+    
+        // Create the staging texture
+        let staging_texture = unsafe {
+            let mut texture_out = None;
+            let result = device.CreateTexture2D(
+                &texture_desc, 
+                None, 
+                Some(&mut texture_out)
+            );
+            
+            if result.is_err() {
+                println!("Failed to create staging texture: {:?}", result);
+                return Err(result.unwrap_err());
+            }
+            
+            texture_out.unwrap()
+        };
+    
+        // Copy the frame texture to our staging texture
+        unsafe { context.CopyResource(&staging_texture, texture) };
+    
+        // Map the staging texture to get access to its data
+        let mut mapped_resource = unsafe { std::mem::zeroed::<D3D11_MAPPED_SUBRESOURCE>() };
+        let map_result = unsafe {
+            context.Map(
+                &staging_texture,
+                0, // Subresource index
+                D3D11_MAP_READ,
+                0, // MapFlags
+                Some(&mut mapped_resource),
+            )
+        };
+        
+        if map_result.is_err() {
+            println!("Failed to map texture: {:?}", map_result);
+            return Err(map_result.unwrap_err());
+        }
+    
+        // Analyze the pixel data
+        let analysis = unsafe {
+            let row_pitch = mapped_resource.RowPitch;
+            let data_ptr = mapped_resource.pData as *const u8;
+            
+            let mut is_black = true;
+            let mut non_black_count = 0;
+            let mut max_brightness = 0u8;
+            let mut sample_pixels = Vec::new();
+            let sample_step = 16; // Check every Nth pixel for performance
+            let mut analyzed_pixels = 0;
+            
+            for y in 0..texture_desc.Height {
+                if y % sample_step != 0 {
+                    continue;
+                }
+                
+                let row_start = data_ptr.add((y * row_pitch) as usize);
+                
+                for x in 0..texture_desc.Width {
+                    if x % sample_step != 0 {
+                        continue;
+                    }
+                    
+                    analyzed_pixels += 1;
+                    let pixel_offset = (x * 4) as usize; // 4 bytes per pixel
+                    let pixel = row_start.add(pixel_offset);
+                    
+                    // BGRA format - B, G, R values at offsets 0, 1, 2
+                    let b = *pixel;
+                    let g = *pixel.add(1);
+                    let r = *pixel.add(2);
+                    
+                    // Calculate max brightness across RGB channels
+                    let brightness = b.max(g).max(r);
+                    max_brightness = max_brightness.max(brightness);
+                    
+                    // Check if pixel is non-black (allowing for some near-black noise)
+                    if brightness > 5 { // Threshold for "black enough"
+                        is_black = false;
+                        non_black_count += 1;
+                        
+                        // Store some samples for debugging (up to 10)
+                        if sample_pixels.len() < 10 {
+                            sample_pixels.push((x, y, [r, g, b]));
+                        }
+                    }
+                }
+            }
+            
+            // Calculate non-black percentage based on our sampling
+            let non_black_percentage = if analyzed_pixels > 0 {
+                (non_black_count as f32 / analyzed_pixels as f32) * 100.0
+            } else {
+                0.0
+            };
+            
+            // Unmap when done
+            context.Unmap(&staging_texture, 0);
+            
+            FrameAnalysisResult {
+                is_black,
+                non_black_percentage,
+                max_brightness,
+                sample_pixels,
+                analyzed_pixels,
+            }
+        };
+    
+        Ok(analysis)
     }
 
     // Optional: Provide a blocking version

@@ -426,13 +426,13 @@ impl SampleGenerator {
             )?;
             
             // Print pixel values at various positions
-            println!("Frame dimensions: {}x{}, Format: {:?}", width, height, desc.Format);
+            //println!("Frame dimensions: {}x{}, Format: {:?}", width, height, desc.Format);
             
             let pixel_data = mapped_resource.pData as *const u8;
             let row_pitch = mapped_resource.RowPitch;
             
             // Print format information first
-            println!("Format: {:?}, Row pitch: {}", desc.Format, row_pitch);
+            //println!("Format: {:?}, Row pitch: {}", desc.Format, row_pitch);
             
             // Sample pixels at different locations regardless of format
             // Just print raw bytes for now since we don't know the exact format
@@ -450,7 +450,7 @@ impl SampleGenerator {
             };
             
             // Top-left pixel
-            println!("Top-left pixel raw bytes:");
+            //println!("Top-left pixel raw bytes:");
             for i in 0..bytes_per_pixel {
                 print!("{:02X} ", *pixel_data.add(i));
             }
@@ -460,7 +460,7 @@ impl SampleGenerator {
             let center_x = width / 2;
             let center_y = height / 2;
             let offset_center = (center_y * row_pitch as u32 + center_x * bytes_per_pixel as u32) as usize;
-            println!("Center pixel raw bytes:");
+            //println!("Center pixel raw bytes:");
             for i in 0..bytes_per_pixel {
                 print!("{:02X} ", *pixel_data.add(offset_center + i));
             }
@@ -468,7 +468,7 @@ impl SampleGenerator {
             
             // Bottom-right pixel
             let offset_br = ((height - 1) * row_pitch as u32 + (width - 1) * bytes_per_pixel as u32) as usize;
-            println!("Bottom-right pixel raw bytes:");
+            //println!("Bottom-right pixel raw bytes:");
             for i in 0..bytes_per_pixel {
                 print!("{:02X} ", *pixel_data.add(offset_br + i));
             }
@@ -484,9 +484,9 @@ impl SampleGenerator {
                 sum < 15 // If sum of first 3 color channels is less than 15, consider it black
             };
             
-            if is_black(0) && is_black(offset_center) && is_black(offset_br) {
+            /*if is_black(0) && is_black(offset_center) && is_black(offset_br) {
                 println!("WARNING: Frame appears to be mostly black at capture level!");
-            }
+            }*/
             
             // Unmap the resource when done
             self.d3d_context.Unmap(&staging_texture, 0);
