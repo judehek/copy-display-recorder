@@ -5,7 +5,7 @@ use windows::{
     Win32::{
         Foundation::RECT,
         Graphics::{
-            Direct3D11::{ID3D11Device, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING},
+            Direct3D11::{ID3D11Device, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING},
             Dxgi::{
                 IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, DXGI_RESOURCE_PRIORITY_MAXIMUM
             },
@@ -100,6 +100,7 @@ pub struct AcquiredFrame {
 pub struct CaptureFrameGenerator {
     _d3d_device: ID3D11Device,
     duplication: IDXGIOutputDuplication,
+    buffer_texture: Option<ID3D11Texture2D>,
     width: u32,
     height: u32,
 }
@@ -142,6 +143,7 @@ impl CaptureFrameGenerator {
         Ok(Self {
             _d3d_device: d3d_device,
             duplication,
+            buffer_texture: None,
             width,
             height,
         })
@@ -153,12 +155,12 @@ impl CaptureFrameGenerator {
 
     // Timeout is in milliseconds
     pub fn try_get_next_frame(&mut self, timeout_ms: u32) -> Result<Option<AcquiredFrame>> {
-        println!("Attempting to acquire next frame with timeout: {} ms", timeout_ms);
-        
+        //println!("Attempting to acquire next frame with timeout: {} ms", timeout_ms); // Keep if needed
+    
         let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = Default::default();
         let mut desktop_resource: Option<IDXGIResource> = None;
     
-        println!("Calling AcquireNextFrame...");
+        //println!("Calling AcquireNextFrame..."); // Keep if needed
         let acquire_result = unsafe {
             self.duplication
                 .AcquireNextFrame(timeout_ms, &mut frame_info, &mut desktop_resource)
@@ -166,46 +168,109 @@ impl CaptureFrameGenerator {
     
         match acquire_result {
             Ok(_) => {
-                println!("AcquireNextFrame succeeded, frame info: {:?}", frame_info);
-                
+                //println!("AcquireNextFrame succeeded, frame info: {:?}", frame_info); // Keep if needed
+    
                 let desktop_resource = desktop_resource
                     .expect("AcquireNextFrame succeeded but returned null resource");
-                println!("Got desktop resource, casting to ID3D11Texture2D");
-                
-                let texture: ID3D11Texture2D = desktop_resource.cast()?;
-                match self.analyze_frame(&texture) {
+                //println!("Got desktop resource, casting to ID3D11Texture2D"); // Keep if needed
+    
+                // --- Start Change ---
+                let acquired_texture: ID3D11Texture2D = desktop_resource.cast()?;
+    
+                // Ensure buffer_texture exists and matches description
+                let mut desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe { acquired_texture.GetDesc(&mut desc) };
+
+                let acquired_texture: ID3D11Texture2D = desktop_resource.cast()?;
+                /*println!("Analyzing acquired_texture BEFORE copy...");
+                match self.analyze_frame(&acquired_texture) { // Analyze the ORIGINAL
+                    Ok(analysis) => println!(" -> BEFORE analysis result: black={}, non_black%={:.2}, max_brightness={}", analysis.is_black, analysis.non_black_percentage, analysis.max_brightness),
+                    Err(e) => println!(" -> Error analyzing BEFORE copy: {:?}", e),
+                }*/
+    
+                // We need a texture we can copy *to*, it doesn't need CPU access here
+                // It should be usable as a source later, so default usage is fine.
+                let buffer_desc = D3D11_TEXTURE2D_DESC {
+                    Width: desc.Width,
+                    Height: desc.Height,
+                    MipLevels: 1,        // Must be 1 for CopyResource
+                    ArraySize: 1,        // Must be 1 for DuplicateOutput textures
+                    Format: desc.Format, // MUST match the source format
+                    SampleDesc: desc.SampleDesc, // MUST match the source sample desc
+                    Usage: D3D11_USAGE_DEFAULT, // Suitable for GPU-GPU copies
+                    BindFlags: 0,        // NO specific bind flags needed
+                    CPUAccessFlags: 0,   // NO CPU access needed
+                    MiscFlags: 0,        // NO misc flags needed (clear potentially problematic ones like SHARED)
+                    ..Default::default() // Ensure other fields are zeroed
+                };
+    
+                // Check if buffer needs creation or recreation
+                let mut create_new_buffer = true;
+                if let Some(buffer) = &self.buffer_texture {
+                    let mut buffer_current_desc = D3D11_TEXTURE2D_DESC::default();
+                    unsafe { buffer.GetDesc(&mut buffer_current_desc) };
+                    if buffer_current_desc.Width == buffer_desc.Width &&
+                       buffer_current_desc.Height == buffer_desc.Height &&
+                       buffer_current_desc.Format == buffer_desc.Format {
+                        create_new_buffer = false;
+                    }
+                }
+    
+                if create_new_buffer {
+                    println!("Creating buffer texture for captured frame copy.");
+                    self.buffer_texture = Some(unsafe {
+                         let mut texture = None;
+                         self._d3d_device.CreateTexture2D(&buffer_desc, None, Some(&mut texture))?;
+                         texture.unwrap()
+                    });
+                }
+    
+                let target_texture = self.buffer_texture.as_ref().unwrap();
+    
+                // Get context and copy
+                let context = unsafe { self._d3d_device.GetImmediateContext()? };
+                unsafe { context.CopyResource(target_texture, &acquired_texture) };
+    
+                // NOW release the frame
+                //println!("Releasing frame"); // Keep if needed
+                unsafe { self.duplication.ReleaseFrame()? };
+    
+                // Return the *cloned handle* to our owned buffer texture
+                // Cloning the COM pointer just increases the ref count
+                let texture_copy = target_texture.clone();
+                println!("test");
+                // Frame analysis (optional, can be done on texture_copy or target_texture)
+                /*match self.analyze_frame(&texture_copy) { // Analyze the copy
                     Ok(analysis) => {
-                        println!("Frame analysis: black={}, non-black pixels={:.2}%, max brightness={}", 
-                            analysis.is_black, analysis.non_black_percentage, analysis.max_brightness);
-                        
-                        if !analysis.is_black && !analysis.sample_pixels.is_empty() {
-                            println!("Sample non-black pixels:");
-                            for (i, (x, y, rgb)) in analysis.sample_pixels.iter().enumerate().take(5) {
-                                println!("  Pixel {}: ({}, {}) RGB={:?}", i, x, y, rgb);
-                            }
+                        if analysis.is_black {
+                             println!("Frame analysis: FRAME IS BLACK (Black Pixels: {:.2}%, Max Brightness: {})", analysis.non_black_percentage, analysis.max_brightness);
+                        } else {
+                             println!("Frame analysis: Non-Black Pixels: {:.2}%, Max Brightness: {}", analysis.non_black_percentage, analysis.max_brightness);
+                            // if !analysis.sample_pixels.is_empty() {
+                            //     println!("Sample non-black pixels:");
+                            //     for (i, (x, y, rgb)) in analysis.sample_pixels.iter().enumerate().take(2) { // Limit logging
+                            //         println!("  Pixel {}: ({}, {}) RGB={:?}", i, x, y, rgb);
+                            //     }
+                            // }
                         }
                     },
                     Err(e) => println!("Error analyzing frame: {:?}", e),
-                }
-                println!("Successfully cast resource to texture");
-                
-                // Release the frame immediately after getting the texture
-                println!("Releasing frame");
-                unsafe { self.duplication.ReleaseFrame()? };
-                
-                println!("Frame acquisition complete");
+                }*/
+    
+                //println!("Frame acquisition complete, returning copied texture."); // Keep if needed
                 Ok(Some(AcquiredFrame {
-                    texture,
+                    texture: texture_copy, // Return the copy
                     frame_info,
                 }))
+                // --- End Change ---
+    
             }
             Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                println!("Frame acquisition timed out after {} ms", timeout_ms);
+                //println!("Frame acquisition timed out after {} ms", timeout_ms); // Keep if needed
                 Ok(None) // Timeout is not an error condition here
             }
             Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => {
                 println!("ERROR: Access lost to desktop duplication: {:?}", err);
-                // Re-initialization might be needed, signal this as an error
                 Err(err.into())
             }
             Err(err) => {
