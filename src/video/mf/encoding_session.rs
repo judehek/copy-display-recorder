@@ -76,6 +76,7 @@ struct SampleGenerator {
     frame_generator: CaptureFrameGenerator,
 
     target_frame_duration: TimeSpan, // Calculate this in new(): 1_000_000_0 / frame_rate
+    next_target_relative_timestamp: Option<TimeSpan>,
     last_returned_relative_timestamp: Option<TimeSpan>,
     seen_first_time_stamp: bool,
     first_timestamp: TimeSpan,
@@ -346,6 +347,7 @@ impl SampleGenerator {
             render_target_view,
             frame_generator,
             target_frame_duration,
+            next_target_relative_timestamp: None,
             last_returned_relative_timestamp: None,
             seen_first_time_stamp: false,
             first_timestamp: TimeSpan::default(),
@@ -353,61 +355,63 @@ impl SampleGenerator {
     }
 
     pub fn generate(&mut self) -> Result<Option<VideoEncoderInputSample>> {
-        loop { // Keep trying until we find a suitable frame or timeout/error
-            match self.frame_generator.try_get_next_frame(33) { // Use a shorter timeout (e.g., ~1 frame time)
+        loop {
+            // Try to get the next frame with a short timeout.
+            match self.frame_generator.try_get_next_frame(33) {
                 Ok(Some(frame)) => {
                     // --- Timestamp Calculation ---
                     let frame_qpc_time = frame.frame_info.LastPresentTime;
                     let timestamp = convert_qpc_to_timespan(frame_qpc_time)?;
-
+    
+                    // On the first frame, set the base timestamp and initialize the scheduled target.
                     if !self.seen_first_time_stamp {
                         self.first_timestamp = timestamp;
+                        // The next target is set to the target frame duration, relative to the first timestamp.
+                        self.next_target_relative_timestamp = Some(TimeSpan {
+                            Duration: self.target_frame_duration.Duration,
+                        });
                         self.seen_first_time_stamp = true;
                     }
+                    // Compute the current relative timestamp.
                     let current_relative_timestamp = TimeSpan {
                         Duration: timestamp.Duration.saturating_sub(self.first_timestamp.Duration),
                     };
                     // --- End Timestamp Calculation ---
-
-                    // --- Rate Control Logic ---
-                    // BEGIN DETAILED LOGGING
-                    println!("Current relative timestamp: {} ms", current_relative_timestamp.Duration / 10000); // Convert to ms
-                    
-                    if let Some(last_ts) = self.last_returned_relative_timestamp {
-                        println!("Last returned timestamp: {} ms", last_ts.Duration / 10000);
-                    } else {
-                        println!("Last returned timestamp: None");
-                    }
-                    
-                    println!("Target frame duration: {} ms", self.target_frame_duration.Duration / 10000);
-                    
-                    let should_return_frame = match self.last_returned_relative_timestamp {
-                        None => {
-                            println!("Should return frame: true (first frame)");
-                            true // Always return the first frame
-                        },
-                        Some(last_ts) => {
-                            let should_return = current_relative_timestamp.Duration >=
-                                last_ts.Duration + self.target_frame_duration.Duration;
-                            println!("Should return frame: {} (comparison result)", should_return);
-                            should_return
-                        }
-                    };
-                    // END DETAILED LOGGING
-                    // --- End Rate Control Logic ---
-
-                    if should_return_frame {
+    
+                    // --- Scheduled Rate Control Logic ---
+                    println!(
+                        "Current relative timestamp: {} ms",
+                        current_relative_timestamp.Duration / 10_000
+                    );
+                    // Retrieve the next scheduled target time.
+                    let scheduled_time = self.next_target_relative_timestamp
+                        .expect("next_target_relative_timestamp should be set on first frame");
+                    println!(
+                        "Next scheduled target: {} ms",
+                        scheduled_time.Duration / 10_000
+                    );
+                    println!(
+                        "Target frame duration: {} ms",
+                        self.target_frame_duration.Duration / 10_000
+                    );
+    
+                    // Accept the frame if we have reached the scheduled target.
+                    if current_relative_timestamp.Duration >= scheduled_time.Duration {
                         println!("Returning frame");
-                        // Process this frame
+                        // Update the scheduler: Add the target frame duration to the current scheduled time.
+                        self.next_target_relative_timestamp = Some(TimeSpan {
+                            Duration: scheduled_time.Duration + self.target_frame_duration.Duration,
+                        });
+                        // --- End Scheduled Rate Control Logic ---
+    
+                        // --- Frame Processing ---
                         let start_time = std::time::Instant::now();
-                        match self.generate_from_frame(&frame, current_relative_timestamp) { // Pass relative ts
+                        match self.generate_from_frame(&frame, current_relative_timestamp) {
                             Ok(sample) => {
                                 let elapsed = start_time.elapsed();
                                 println!("Frame generation took: {:?}", elapsed);
-                                
-                                // Update the timestamp of the last frame we *returned*
                                 self.last_returned_relative_timestamp = Some(current_relative_timestamp);
-                                return Ok(Some(sample)); // Return the processed frame
+                                return Ok(Some(sample)); // Return the processed frame.
                             }
                             Err(error) => {
                                 eprintln!(
@@ -415,36 +419,29 @@ impl SampleGenerator {
                                     error.code(),
                                     error.message()
                                 );
-                                // Decide how to handle generation error: continue loop? return None? return Err?
-                                // For now, let's continue trying to get the next frame.
-                                // continue; // Or return Ok(None) if you want the encoder loop to potentially exit
-                                return Ok(None); // Returning None might signal end-of-stream prematurely
+                                return Ok(None); // Signal end-of-stream, or you might choose to continue.
                             }
                         }
                     } else {
                         println!("Skipping frame (arrived too early)");
-                        // Frame arrived too early, discard it and try acquiring the next one.
-                        // The AcquiredFrame's texture is implicitly dropped here.
-                        continue;
+                        continue; // Frame arrived before scheduled target; skip it.
                     }
                 }
                 Ok(None) => {
-                    // Timeout acquiring frame, signal to encoder we have nothing right now.
+                    // Timeout acquiring a frame.
                     return Ok(None);
                 }
                 Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
                     eprintln!("DXGI Access Lost in frame generation: {:?}", e);
-                    // Signal error or end-of-stream
-                    return Err(e); // Or maybe Ok(None) depending on desired behavior
+                    return Err(e);
                 }
                 Err(e) => {
                     eprintln!("Error getting next frame: {:?}", e);
-                    // Signal error or end-of-stream
-                    return Err(e); // Or maybe Ok(None)
+                    return Err(e);
                 }
             }
         }
-    }
+    }    
 
     fn generate_from_frame(
         &mut self,
