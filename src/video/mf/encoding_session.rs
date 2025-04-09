@@ -75,6 +75,8 @@ struct SampleGenerator {
 
     frame_generator: CaptureFrameGenerator,
 
+    target_frame_duration: TimeSpan, // Calculate this in new(): 1_000_000_0 / frame_rate
+    last_returned_relative_timestamp: Option<TimeSpan>,
     seen_first_time_stamp: bool,
     first_timestamp: TimeSpan,
 }
@@ -129,6 +131,7 @@ impl MFVideoEncodingSession {
             monitor_handle,
             input_size,
             output_size,
+            frame_rate,
         ) {
             Ok(generator) => {
                 println!("SampleGenerator created successfully");
@@ -211,6 +214,7 @@ impl SampleGenerator {
         monitor_handle: HMONITOR,
         input_size: SizeInt32,
         output_size: SizeInt32,
+        frame_rate: u32,
     ) -> Result<Self> {
         println!("SampleGenerator::new starting...");
         println!("Input size: {}x{}, Output size: {}x{}", 
@@ -324,6 +328,14 @@ impl SampleGenerator {
                 input_size.Width, input_size.Height, gen_width, gen_height
             );
         }
+
+        let target_frame_duration = TimeSpan {
+            Duration: 10_000_000 / (frame_rate as i64), // TimeSpan is in 100ns units
+        };
+        if target_frame_duration.Duration <= 0 {
+             // Handle error: frame_rate too high or zero
+             return Err(windows::core::Error::new(windows::Win32::Foundation::E_INVALIDARG, "Invalid frame rate".into()));
+        }
     
         println!("SampleGenerator::new completed successfully");
         Ok(Self {
@@ -333,36 +345,103 @@ impl SampleGenerator {
             compose_texture,
             render_target_view,
             frame_generator,
+            target_frame_duration,
+            last_returned_relative_timestamp: None,
             seen_first_time_stamp: false,
             first_timestamp: TimeSpan::default(),
         })
     }
 
     pub fn generate(&mut self) -> Result<Option<VideoEncoderInputSample>> {
-        match self.frame_generator.try_get_next_frame(100) {
-            Ok(Some(frame)) => {
-                match self.generate_from_frame(&frame) {
-                    Ok(sample) => Ok(Some(sample)),
-                    Err(error) => {
-                        eprintln!(
-                            "Error during input sample generation: {:?} - {}",
-                            error.code(),
-                            error.message()
-                        );
-                        Ok(None)
+        loop { // Keep trying until we find a suitable frame or timeout/error
+            match self.frame_generator.try_get_next_frame(33) { // Use a shorter timeout (e.g., ~1 frame time)
+                Ok(Some(frame)) => {
+                    // --- Timestamp Calculation ---
+                    let frame_qpc_time = frame.frame_info.LastPresentTime;
+                    let timestamp = convert_qpc_to_timespan(frame_qpc_time)?;
+
+                    if !self.seen_first_time_stamp {
+                        self.first_timestamp = timestamp;
+                        self.seen_first_time_stamp = true;
+                    }
+                    let current_relative_timestamp = TimeSpan {
+                        Duration: timestamp.Duration.saturating_sub(self.first_timestamp.Duration),
+                    };
+                    // --- End Timestamp Calculation ---
+
+                    // --- Rate Control Logic ---
+                    // BEGIN DETAILED LOGGING
+                    println!("Current relative timestamp: {} ms", current_relative_timestamp.Duration / 10000); // Convert to ms
+                    
+                    if let Some(last_ts) = self.last_returned_relative_timestamp {
+                        println!("Last returned timestamp: {} ms", last_ts.Duration / 10000);
+                    } else {
+                        println!("Last returned timestamp: None");
+                    }
+                    
+                    println!("Target frame duration: {} ms", self.target_frame_duration.Duration / 10000);
+                    
+                    let should_return_frame = match self.last_returned_relative_timestamp {
+                        None => {
+                            println!("Should return frame: true (first frame)");
+                            true // Always return the first frame
+                        },
+                        Some(last_ts) => {
+                            let should_return = current_relative_timestamp.Duration >=
+                                last_ts.Duration + self.target_frame_duration.Duration;
+                            println!("Should return frame: {} (comparison result)", should_return);
+                            should_return
+                        }
+                    };
+                    // END DETAILED LOGGING
+                    // --- End Rate Control Logic ---
+
+                    if should_return_frame {
+                        println!("Returning frame");
+                        // Process this frame
+                        let start_time = std::time::Instant::now();
+                        match self.generate_from_frame(&frame, current_relative_timestamp) { // Pass relative ts
+                            Ok(sample) => {
+                                let elapsed = start_time.elapsed();
+                                println!("Frame generation took: {:?}", elapsed);
+                                
+                                // Update the timestamp of the last frame we *returned*
+                                self.last_returned_relative_timestamp = Some(current_relative_timestamp);
+                                return Ok(Some(sample)); // Return the processed frame
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "Error during input sample generation: {:?} - {}",
+                                    error.code(),
+                                    error.message()
+                                );
+                                // Decide how to handle generation error: continue loop? return None? return Err?
+                                // For now, let's continue trying to get the next frame.
+                                // continue; // Or return Ok(None) if you want the encoder loop to potentially exit
+                                return Ok(None); // Returning None might signal end-of-stream prematurely
+                            }
+                        }
+                    } else {
+                        println!("Skipping frame (arrived too early)");
+                        // Frame arrived too early, discard it and try acquiring the next one.
+                        // The AcquiredFrame's texture is implicitly dropped here.
+                        continue;
                     }
                 }
-            }
-            Ok(None) => {
-                Ok(None) // Timeout
-            }
-            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                eprintln!("DXGI Access Lost in frame generation: {:?}", e);
-                Ok(None)
-            }
-            Err(e) => {
-                eprintln!("Error getting next frame: {:?}", e);
-                Ok(None)
+                Ok(None) => {
+                    // Timeout acquiring frame, signal to encoder we have nothing right now.
+                    return Ok(None);
+                }
+                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                    eprintln!("DXGI Access Lost in frame generation: {:?}", e);
+                    // Signal error or end-of-stream
+                    return Err(e); // Or maybe Ok(None) depending on desired behavior
+                }
+                Err(e) => {
+                    eprintln!("Error getting next frame: {:?}", e);
+                    // Signal error or end-of-stream
+                    return Err(e); // Or maybe Ok(None)
+                }
             }
         }
     }
@@ -370,18 +449,9 @@ impl SampleGenerator {
     fn generate_from_frame(
         &mut self,
         frame: &AcquiredFrame,
+        relative_timestamp: TimeSpan,
     ) -> Result<VideoEncoderInputSample> {
-        let frame_qpc_time = frame.frame_info.LastPresentTime;
-        let timestamp = convert_qpc_to_timespan(frame_qpc_time)?;
-    
-        if !self.seen_first_time_stamp {
-            self.first_timestamp = timestamp;
-            self.seen_first_time_stamp = true;
-        }
-        let relative_timestamp = TimeSpan {
-            Duration: timestamp.Duration - self.first_timestamp.Duration,
-        };
-    
+
         let frame_texture = &frame.texture;
         let desc = unsafe {
             let mut desc = D3D11_TEXTURE2D_DESC::default();

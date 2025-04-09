@@ -195,7 +195,7 @@ impl VideoEncoder {
                     input_resolution.Width as u32,
                     input_resolution.Height as u32,
                 )?;
-                MFSetAttributeRatio(&attributes, &MF_MT_FRAME_RATE, 60, 1)?;
+                MFSetAttributeRatio(&attributes, &MF_MT_FRAME_RATE, 120, 1)?;
                 let result = transform.SetInputType(
                     input_stream_id,
                     &input_type,
