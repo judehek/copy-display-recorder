@@ -61,7 +61,6 @@ struct AudioThreadParams {
     wave_format: WAVEFORMATEXTENSIBLE,
     sample_sender: SyncSender<(u32, AudioDataPacket)>,
     audio_stream_index: u32,
-    qpc_frequency: i64,
     stop_signal: Arc<AtomicBool>,
 }
 
@@ -71,7 +70,6 @@ pub struct AudioCapture {
     wave_format: WAVEFORMATEXTENSIBLE,
     source: AudioSource,
     audio_stream_index: u32,
-    qpc_frequency: i64,
     media_type: IMFMediaType,
     thread_handle: Option<JoinHandle<Result<()>>>,
     stop_signal: Arc<AtomicBool>,
@@ -186,13 +184,6 @@ impl AudioCapture {
             // Create the IMFMediaType needed by the SinkWriter/Consumer
             let media_type = Self::create_mf_media_type(&desired_wave_format)?;
 
-            // Get QPC Frequency for timestamp calculations
-            let mut frequency = 0;
-            QueryPerformanceFrequency(&mut frequency)?;
-            if frequency <= 0 { // Frequency should be positive
-                return Err(windows::core::Error::new(E_FAIL,"Invalid QPC frequency".into()));
-            }
-
             let stop_signal = Arc::new(AtomicBool::new(false));
 
             Ok(Self {
@@ -200,7 +191,6 @@ impl AudioCapture {
                 wave_format: desired_wave_format,
                 source,
                 audio_stream_index,
-                qpc_frequency: frequency,
                 media_type,
                 thread_handle: None, // Thread started via start()
                 stop_signal,
@@ -288,7 +278,6 @@ impl AudioCapture {
             wave_format: self.wave_format, // WAVEFORMATEXTENSIBLE is Copy
             sample_sender, // Move sender ownership to params
             audio_stream_index: self.audio_stream_index,
-            qpc_frequency: self.qpc_frequency,
             stop_signal: self.stop_signal.clone(), // Clone Arc
         };
 
@@ -432,6 +421,15 @@ unsafe fn audio_capture_thread(params: AudioThreadParams) -> Result<()> {
              return Err(windows::core::Error::new(E_FAIL, "Invalid audio format: SampleRate is zero".into()));
         }
 
+        // --- DEBUGGING: Counters ---
+        let mut get_buffer_calls = 0u64;
+        let mut successful_gets = 0u64;
+        let mut silent_packets = 0u64;
+        let mut data_packets = 0u64;
+        let mut zero_frame_sok_calls = 0u64; // Count the specific warning scenario
+        let mut last_log_time = std::time::Instant::now();
+        // --- END DEBUGGING ---
+
 
         while !params.stop_signal.load(Ordering::SeqCst) {
             // Wait for data or timeout
@@ -457,16 +455,19 @@ unsafe fn audio_capture_thread(params: AudioThreadParams) -> Result<()> {
                         let mut device_position = 0u64; // Can be useful for lip sync?
                         let mut qpc_position = 0u64;    // Raw QPC value for timestamp
 
-                        // GetBuffer returns Result<(), Error> directly
+                        // --- DEBUGGING: Increment GetBuffer call count ---
+                        get_buffer_calls += 1;
+                        // --- END DEBUGGING ---
+
                         let result = capture_client.GetBuffer(
                             &mut buffer_ptr, &mut frames_available, &mut flags,
                             Some(&mut device_position), Some(&mut qpc_position),
                         );
 
-                        // --- Result Handling ---
                         match result {
                             Ok(()) => {
-                                // Buffer obtained successfully, continue processing
+                                // Buffer obtained successfully (S_OK)
+                                successful_gets += 1; // Count all S_OK calls
                             },
                             Err(err) if err.code() == AUDCLNT_S_BUFFER_EMPTY => {
                                 // Buffer is empty, no more data in this cycle. Wait for next event.
@@ -475,42 +476,72 @@ unsafe fn audio_capture_thread(params: AudioThreadParams) -> Result<()> {
                             Err(err) => {
                                 // An actual error occurred. Log and return.
                                 eprintln!("IAudioCaptureClient::GetBuffer failed: {:?}", err);
+                                // --- DEBUGGING: Log counts on error ---
+                                println!("DEBUG STATS on Error: GetBufferCalls={}, SuccessfulGets={}, ZeroFrameS_OK={}, DataPackets={}, SilentPackets={}",
+                                          get_buffer_calls, successful_gets, zero_frame_sok_calls, data_packets, silent_packets);
+                                // --- END DEBUGGING ---
                                 return Err(err);
                             }
                         }
-                        // If here, hr is S_OK, data should be available.
-                        // --- End HRESULT Handling ---
 
 
                         if params.stop_signal.load(Ordering::SeqCst) {
                             println!("Stop signal received after GetBuffer.");
-                            // Need to release the buffer if we successfully got one
                             if frames_available > 0 { capture_client.ReleaseBuffer(frames_available)?; }
                             break; // Exit inner loop
                         }
 
                         if frames_available == 0 {
-                            // This shouldn't happen if hr was S_OK, but check anyway.
-                            println!("Warning: GetBuffer succeeded (S_OK) but frames_available is 0.");
+                            // This is the specific warning case: S_OK but 0 frames.
+                            // Increment the specific counter
+                            zero_frame_sok_calls += 1;
+                            // Keep the original warning if desired, or comment it out
+                            // println!("Warning: GetBuffer succeeded (S_OK) but frames_available is 0.");
+
                             // Must still release the (empty) buffer.
-                            capture_client.ReleaseBuffer(frames_available)?;
+                            capture_client.ReleaseBuffer(frames_available)?; // frames_available is 0 here
                             continue; // Try getting buffer status again immediately
                         }
 
 
-                        // --- Process Buffer Data ---
+                        // --- If we reach here, GetBuffer returned S_OK AND frames_available > 0 ---
+                        // --- DEBUGGING: Log that we got actual frames ---
+                        println!(
+                            "DEBUG: Got Buffer! Frames: {}, Flags: 0x{:X}, QPC: {}, DevicePos: {}",
+                            frames_available, flags, qpc_position, device_position
+                        );
+                        // --- END DEBUGGING ---
+
+
                         let bytes_available = frames_available * block_align;
-                        let timestamp_100ns = convert_qpc_to_mf_timespan(qpc_position as i64, params.qpc_frequency)?;
+                        let timestamp_100ns = convert_qpc_to_mf_timespan(qpc_position as i64)?;
+                        println!("AUDIO DEBUG: Raw QPC={}, Converted MF Time={}ns", 
+                            qpc_position, timestamp_100ns);
                         let duration_100ns = (frames_available as i64 * 10_000_000) / (sample_rate as i64);
 
                         let mut audio_packet_data: Option<Vec<u8>> = None;
 
                         if flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
-                            // WASAPI indicates silence, send None data
-                            // println!("Audio Packet: SILENCE ({} frames)", frames_available); // Can be verbose
+                            // --- DEBUGGING: Log silent packet ---
+                            println!("DEBUG: Silent packet received ({} frames)", frames_available);
+                            silent_packets += 1;
+                            // --- END DEBUGGING ---
                             audio_packet_data = None;
                         } else if !buffer_ptr.is_null() {
-                            // Valid data buffer, copy it into a Vec
+                            // --- DEBUGGING: Log data packet ---
+                            println!(
+                                "DEBUG: Data packet received ({} frames, {} bytes)",
+                                frames_available, bytes_available
+                            );
+                            data_packets += 1;
+                            // --- END DEBUGGING ---
+
+                            // --- DEBUGGING: Optionally log first few bytes ---
+                            // Be careful: This can be very verbose!
+                            // let data_slice = std::slice::from_raw_parts(buffer_ptr, bytes_available as usize);
+                            // println!("DEBUG: First few bytes: {:?}", &data_slice[..std::cmp::min(16, data_slice.len())]);
+                            // --- END DEBUGGING ---
+
                             let mut data_vec = vec![0u8; bytes_available as usize];
                             std::ptr::copy_nonoverlapping(
                                 buffer_ptr as *const u8,
@@ -521,40 +552,48 @@ unsafe fn audio_capture_thread(params: AudioThreadParams) -> Result<()> {
                         } else {
                             // Non-silent flag but null buffer? This is unexpected.
                             eprintln!("Warning: Got non-silent flag from GetBuffer but null buffer pointer.");
-                            audio_packet_data = None; // Treat as silence to avoid panic
+                             // --- DEBUGGING: Log this weird state ---
+                            println!("DEBUG: Non-silent flag but NULL buffer pointer!");
+                            // Treat as silence to avoid panic
+                            silent_packets += 1; // Count it as effectively silent
+                            // --- END DEBUGGING ---
+                            audio_packet_data = None;
                         }
 
                         let packet = AudioDataPacket {
                             data: audio_packet_data,
                             timestamp: timestamp_100ns,
                             duration: duration_100ns,
-                            flags: 0, // Set flags like discontinuity if needed based on WASAPI flags/state
+                            flags: flags, // Pass flags along now
                         };
-                        // --- End Process Buffer Data ---
 
+                        // --- DEBUGGING: Log before send ---
+                        // println!("DEBUG: Attempting to send packet (Timestamp: {})", packet.timestamp);
+                        // --- END DEBUGGING ---
 
-                        // --- Send Packet via Channel ---
-                        // Use try_send to avoid blocking this audio thread if the receiver is slow/full.
                         if params.sample_sender.try_send((params.audio_stream_index, packet)).is_err() {
                             eprintln!("Audio sample sender disconnected or buffer full. Stopping thread.");
-                            // Release the WASAPI buffer *before* breaking out
+                            // --- DEBUGGING: Log send failure and stats ---
+                            println!("DEBUG: try_send FAILED.");
+                            println!("DEBUG STATS on Send Fail: GetBufferCalls={}, SuccessfulGets={}, ZeroFrameS_OK={}, DataPackets={}, SilentPackets={}",
+                                      get_buffer_calls, successful_gets, zero_frame_sok_calls, data_packets, silent_packets);
+                            // --- END DEBUGGING ---
+
                             capture_client.ReleaseBuffer(frames_available)?;
-                            params.stop_signal.store(true, Ordering::SeqCst); // Signal self to stop fully
-                            break; // Exit inner loop
+                            params.stop_signal.store(true, Ordering::SeqCst);
+                            break;
+                        } else {
+                            // --- DEBUGGING: Log successful send ---
+                            // println!("DEBUG: Packet sent successfully.");
+                            // --- END DEBUGGING ---
                         }
-                        // --- End Send Packet ---
 
-
-                        // --- Release WASAPI Buffer ---
-                        // Must be called after processing the data and sending the packet.
                         capture_client.ReleaseBuffer(frames_available)?;
-                        // --- End Release WASAPI Buffer ---
 
                     } // End inner loop (processing available packets)
                 }
                 WAIT_TIMEOUT => {
                     // Timeout occurred, just loop again to check stop_signal and wait again.
-                    // println!("Audio thread wait timeout."); // Can be verbose
                     continue;
                 }
                 _ => {
@@ -575,12 +614,6 @@ unsafe fn audio_capture_thread(params: AudioThreadParams) -> Result<()> {
         }
         println!("AudioClient stopped.");
 
-        // Explicitly drop COM objects before CoUninitialize (optional, scope does it)
-        drop(capture_client);
-        drop(audio_client);
-        drop(device);
-        drop(enumerator);
-
         Ok(()) // Thread finished normally
     }) (); // End of COM object lifetime block / error handling closure
 
@@ -593,10 +626,38 @@ unsafe fn audio_capture_thread(params: AudioThreadParams) -> Result<()> {
 // --- Helper function for the RECEIVING end ---
 // Reconstructs an IMFSample from the received AudioDataPacket.
 // This should be called in the thread that consumes data from the channel.
-pub fn create_imf_sample_from_packet(packet: AudioDataPacket) -> Result<IMFSample> {
+pub fn create_imf_sample_from_packet(packet: AudioDataPacket, first_timestamp_100ns: i64) -> Result<IMFSample> {
+    let original_ts = packet.timestamp;
+    let mut relative_ts = packet.timestamp; // Start with original
+
+    if first_timestamp_100ns != -1 {
+        // First timestamp is known, make audio relative
+        relative_ts = packet.timestamp.saturating_sub(first_timestamp_100ns);
+        // Clamp to zero if subtraction resulted in negative time
+        if relative_ts < 0 {
+             println!(
+                 "CREATE SAMPLE DEBUG: Clamping negative relative audio TS ({}) to 0. Orig={}, First={}",
+                 relative_ts, original_ts, first_timestamp_100ns
+             );
+             relative_ts = 0;
+        }
+    } else {
+        // First timestamp not yet known. Set relative TS to 0.
+        println!("CREATE SAMPLE DEBUG: First TS unknown for audio packet (OrigTS={}). Setting relative TS to 0.", original_ts);
+        relative_ts = 0;
+    }
+
+    // --- Add this log if you want to be extra sure ---
+    println!(
+         "CREATE SAMPLE DEBUG: OrigAbsTS={}, FirstTS={}, FinalRelativeTS={}",
+         original_ts, first_timestamp_100ns, relative_ts
+    );
+    // --- End log ---
+
     unsafe {
         let sample = MFCreateSample()?;
-        sample.SetSampleTime(packet.timestamp)?;
+        // --- Use the calculated relative_ts HERE ---
+        sample.SetSampleTime(relative_ts)?;
         sample.SetSampleDuration(packet.duration)?;
 
         // TODO: Handle packet.flags if you implement discontinuity detection etc.
@@ -604,6 +665,8 @@ pub fn create_imf_sample_from_packet(packet: AudioDataPacket) -> Result<IMFSampl
         // if (packet.flags & YOUR_DISCONTINUITY_FLAG) != 0 {
         //     sample.SetUINT32(&MFSampleExtension_Discontinuity, 1)?;
         // }
+        println!("AUDIO DEBUG: Creating sample with timestamp={}ns, duration={}ns", 
+         packet.timestamp, packet.duration);
 
         if let Some(data) = packet.data {
             // Packet contains actual audio data
@@ -670,20 +733,28 @@ impl Drop for AudioCapture {
         // assume the application manages overall COM lifetime.
     }
 }
-pub fn convert_qpc_to_mf_timespan(qpc_time: i64, qpc_frequency: i64) -> Result<i64> {
+pub fn convert_qpc_to_mf_timespan(qpc_time: i64) -> Result<i64> {
     if qpc_time == 0 {
         // Handle zero QPC time (e.g., return 0 MF time or error if needed)
         return Ok(0);
     }
-    if qpc_frequency <= 0 {
+    
+    // Query the frequency each time, like the video code does
+    let mut frequency = 0;
+    unsafe {
+        QueryPerformanceFrequency(&mut frequency)?;
+    }
+    
+    if frequency <= 0 {
         // This should not happen if frequency was queried correctly
         return Err(windows::core::Error::new(
             E_FAIL,
-            "Invalid QPC frequency provided for timestamp conversion".into(),
+            "QueryPerformanceFrequency returned zero".into(),
         ));
     }
+    
     // Calculate duration in 100ns units using i128 for intermediate calculation
     // to avoid overflow with large qpc_time values.
-    let mf_time = (qpc_time as i128 * 10_000_000) / (qpc_frequency as i128);
+    let mf_time = (qpc_time as i128 * 10_000_000) / (frequency as i128);
     Ok(mf_time as i64)
 }

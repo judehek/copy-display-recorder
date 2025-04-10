@@ -1,4 +1,4 @@
-use std::{sync::{mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError}, Arc}, time::Duration};
+use std::{sync::{atomic::{AtomicI64, Ordering}, mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender, TryRecvError}, Arc}, time::Duration};
 
 use windows::{
     core::{ComInterface, Result, HSTRING}, // Ensure ComInterface is imported for .cast()
@@ -41,7 +41,7 @@ struct MFVideoEncodingSession {
 }
 
 // Helper function moved before SampleGenerator impl
-fn convert_qpc_to_timespan(qpc_time: i64) -> Result<TimeSpan> {
+pub fn convert_qpc_to_timespan(qpc_time: i64) -> Result<TimeSpan> {
     if qpc_time == 0 {
         return Ok(TimeSpan::default());
     }
@@ -85,6 +85,7 @@ pub struct SampleWriter {
     video_stream_index: u32,
     audio_stream_index: Option<u32>,
     audio_packet_receiver: Receiver<(u32, AudioDataPacket)>,
+    first_timestamp_100ns: AtomicI64,
 }
 
 
@@ -151,7 +152,6 @@ impl MFVideoEncodingSession {
                 aac_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
                 aac_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 44100)?;
                 aac_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2)?;
-                // Set bitrate to 128kbps (bytes per second = bitrate / 8)
                 aac_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 16000)?;
                 
                 Ok::<IMFMediaType, windows::core::Error>(aac_type)
@@ -521,10 +521,13 @@ impl SampleGenerator {
                     // --- Timestamp Calculation ---
                     let frame_qpc_time = frame.frame_info.LastPresentTime;
                     let timestamp = convert_qpc_to_timespan(frame_qpc_time)?;
+                    println!("VIDEO DEBUG: Raw QPC={}, Converted_Time={}ns", 
+                        frame_qpc_time, timestamp.Duration);
     
                     // On the first frame, set the base timestamp and initialize the scheduled target.
                     if !self.seen_first_time_stamp {
                         self.first_timestamp = timestamp;
+                        println!("VIDEO DEBUG: First timestamp initialized: {}ns", self.first_timestamp.Duration);
                         // The next target is set to the target frame duration, relative to the first timestamp.
                         self.next_target_relative_timestamp = Some(TimeSpan {
                             Duration: self.target_frame_duration.Duration,
@@ -535,6 +538,8 @@ impl SampleGenerator {
                     let current_relative_timestamp = TimeSpan {
                         Duration: timestamp.Duration.saturating_sub(self.first_timestamp.Duration),
                     };
+                    println!("VIDEO DEBUG: Absolute TS={}ns, First TS={}ns, Relative TS={}ns",
+                        timestamp.Duration, self.first_timestamp.Duration, current_relative_timestamp.Duration);
                     // --- End Timestamp Calculation ---
     
                     // --- Scheduled Rate Control Logic ---
@@ -726,6 +731,7 @@ impl SampleWriter {
                 video_stream_index,
                 audio_stream_index,
                 audio_packet_receiver: audio_sample_receiver,
+                first_timestamp_100ns: AtomicI64::new(-1),
             })
         }
     }
@@ -771,6 +777,11 @@ impl SampleWriter {
         let _ = self.write_pending_audio_samples();
 
         unsafe {
+            let video_ts = sample.GetSampleTime()?;
+                println!(
+                    "SAMPLE WRITER VIDEO DEBUG: Writing Video Sample with Timestamp={} (100ns)",
+                    video_ts
+                );
             self.sink_writer
                 .WriteSample(self.video_stream_index, sample)
                 .map_err(|e| {
@@ -786,16 +797,30 @@ impl SampleWriter {
     fn write_pending_audio_samples(&self) -> Result<()> {
         if self.audio_stream_index.is_none() { return Ok(()); }
         let target_audio_index = self.audio_stream_index.unwrap();
-
+    
         loop {
             match self.audio_packet_receiver.try_recv() {
                 Ok((_, packet)) => { // Receive (stream_index, AudioDataPacket)
-                    // Convert AudioDataPacket to IMFSample using the helper function
-                    let sample = create_imf_sample_from_packet(packet)?;
+                    // Get the first timestamp (cheap read, use Acquire for memory synchronization)
+                    let first_ts = self.first_timestamp_100ns.load(Ordering::Acquire);
+
+                    // Now call create_imf_sample_from_packet with the first timestamp
+                    let sample = create_imf_sample_from_packet(packet, first_ts)?;
                     
-                    // Write the sample directly to the sink writer
-                    // The sink writer handles the PCM to AAC conversion automatically
                     unsafe {
+                        println!(
+                            "SAMPLE WRITER AUDIO DEBUG: Received Audio Packet with Absolute Timestamp={} (100ns)",
+                            sample.GetSampleTime()? // Get timestamp from the sample
+                        );
+                        
+                        // ADD THIS LOG:
+                        let audio_ts_before_write = sample.GetSampleTime()?;
+                        println!(
+                            "SAMPLE WRITER AUDIO DEBUG: Writing Audio Sample with Timestamp={} (100ns)",
+                            audio_ts_before_write
+                        );
+                        
+                        // Write the sample
                         let write_result = self.sink_writer.WriteSample(target_audio_index, &sample);
                         
                         if let Err(e) = write_result {
