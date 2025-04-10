@@ -7,6 +7,7 @@ pub enum Resolution {
     Native,
     _720p,
     _1080p,
+    _1440p,
     _2160p,
     _4320p,
 }
@@ -22,10 +23,11 @@ impl FromStr for Resolution {
             "native" => Ok(Resolution::Native),
             "720p" => Ok(Resolution::_720p),
             "1080p" => Ok(Resolution::_1080p),
+            "1440p" => Ok(Resolution::_1440p),
             "2160p" => Ok(Resolution::_2160p),
             "4320p" => Ok(Resolution::_4320p),
             _ => Err(ParseResolutionError(
-                "Invalid resolution value! Expecting: native, 720p, 1080p, 2160p, or 4320p.",
+                "Invalid resolution value! Expecting: native, 720p, 1080p, 1440p, 2160p, or 4320p.",
             )),
         }
     }
@@ -37,6 +39,7 @@ impl Display for Resolution {
             Resolution::Native => "native",
             Resolution::_720p => "720p",
             Resolution::_1080p => "1080p",
+            Resolution::_1440p => "1440p",
             Resolution::_2160p => "2160p",
             Resolution::_4320p => "4320p",
         };
@@ -62,6 +65,10 @@ impl Resolution {
             Resolution::_1080p => Some(SizeInt32 {
                 Width: 1920,
                 Height: 1080,
+            }),
+            Resolution::_1440p => Some(SizeInt32 {
+                Width: 2560,
+                Height: 1440,
             }),
             Resolution::_2160p => Some(SizeInt32 {
                 Width: 3840,

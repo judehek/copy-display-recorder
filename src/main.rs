@@ -6,10 +6,12 @@ mod hotkey;
 mod media;
 mod resolution;
 mod video;
+mod audio;
 
 use std::{path::Path, time::Duration};
 
 use args::Args;
+use audio::AudioSource;
 use clap::Parser;
 use hotkey::HotKey;
 use video::{
@@ -58,6 +60,7 @@ fn run(
     wait_for_debugger: bool,
     console_mode: bool,
     backend: EncoderBackend,
+    audio_source: AudioSource,
 ) -> Result<()> {
     unsafe {
         RoInitialize(RO_INIT_MULTITHREADED)?;
@@ -134,6 +137,7 @@ fn run(
             bit_rate,
             frame_rate,
             stream,
+            audio_source,
         )?;
         if !console_mode {
             let mut is_recording = false;
@@ -185,6 +189,7 @@ fn main() {
     let resolution: Resolution = args.resolution;
     let encoder_index: usize = args.encoder;
     let backend: EncoderBackend = args.backend;
+    let audio_source: AudioSource = args.audio_source;
 
     // Validate some of the params
     if !validate_path(output_path) {
@@ -202,6 +207,7 @@ fn main() {
         wait_for_debugger,
         console_mode,
         backend,
+        audio_source,
     );
 
     // We do this for nicer HRESULT printing when errors occur.
@@ -265,6 +271,7 @@ fn create_encoding_session(
     bit_rate: u32,
     frame_rate: u32,
     stream: IRandomAccessStream,
+    audio_source: AudioSource,
 ) -> Result<Box<dyn VideoEncodingSession>> {
     let result = factory.create_session(
         d3d_device.clone(), // Clone if ownership is needed by session
@@ -273,6 +280,7 @@ fn create_encoding_session(
         bit_rate,
         frame_rate,
         stream,
+        audio_source,
     );
     if result.is_err() {
         println!("Error during encoder setup, try another set of encoding settings.");

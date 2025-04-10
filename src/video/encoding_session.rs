@@ -7,6 +7,8 @@ use windows::{
     },
 };
 
+use crate::audio::AudioSource;
+
 pub trait VideoEncoderSessionFactory {
     fn create_session(
         &self,
@@ -16,6 +18,7 @@ pub trait VideoEncoderSessionFactory {
         bit_rate: u32,
         frame_rate: u32,
         stream: IRandomAccessStream,
+        audio_source: AudioSource,
     ) -> Result<Box<dyn VideoEncodingSession>>;
 }
 
