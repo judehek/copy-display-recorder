@@ -7,6 +7,10 @@ mod media;
 mod resolution;
 mod video;
 mod audio;
+mod window_detector;
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::{path::Path, time::Duration};
 
@@ -124,6 +128,9 @@ fn run(
             CreationCollisionOption::ReplaceExisting,
         )?
         .get()?;
+
+    let is_recording_window = Arc::new(AtomicBool::new(true));
+    let hook = window_detector::start_window_change_detector(is_recording_window.clone());
 
     // Start the recording
     {
