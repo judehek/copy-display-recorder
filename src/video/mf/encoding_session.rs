@@ -1,4 +1,4 @@
-use std::{sync::{mpsc::{sync_channel, Receiver, TryRecvError, SyncSender}, Arc}, time::Duration};
+use std::{sync::{mpsc::{sync_channel, Receiver, SyncSender, TryRecvError}, Arc}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
 use windows::{
     core::{ComInterface, Result, HSTRING},
@@ -72,6 +72,7 @@ struct SampleGenerator {
      // The scheduled presentation time for the *next* frame we want to output,
      // relative to the anchor time (100ns).
      next_target_relative_mf_timestamp: i64,
+     last_processed_frame: Option<AcquiredFrame>, // stored for handling dxgi timeout
 }
 
 
@@ -428,40 +429,50 @@ impl SampleGenerator {
             // Start by targeting the first frame immediately (relative time 0)
             // It will be updated *after* the first frame is processed.
             next_target_relative_mf_timestamp: 0,
+            last_processed_frame: None,
         })
     }
 
+    // TODO: weird stuff happening still, just print setsampletime of video samples, there should be something unusual every 5-10 seconds of recording
     /// Tries to get the next frame, process it, and return an input sample for the encoder.
     pub fn generate(&mut self) -> Result<Option<VideoEncoderInputSample>> {
         loop {
-            match self.frame_generator.try_get_next_frame(33) { // ~30fps timeout
+            match self.frame_generator.try_get_next_frame(8) {
                 Ok(Some(frame)) => {
                     // --- Timestamp Calculation ---
                     let frame_qpc_time = frame.frame_info.LastPresentTime;
                     if frame_qpc_time == 0 {
-                         eprintln!("Warning: Skipping frame with zero QPC timestamp.");
-                         continue;
+                        eprintln!("Warning: Frame has zero QPC timestamp (no desktop updates). Using duplicate logic.");
+                        // Use the same duplicate frame logic as timeout
+                        if let Some(sample) = self.duplicate_last_frame()? {
+                            return Ok(Some(sample));
+                        }
+                        // If we couldn't duplicate (no last frame), continue to get next frame
+                        continue;
                     }
                     let frame_mf_time = convert_qpc_to_mf_timespan(frame_qpc_time)?;
+                    println!("successfully aquired a frame at time: {}", frame_mf_time);
                     // Calculate timestamp relative to the session anchor
                     let current_relative_mf_timestamp = frame_mf_time.saturating_sub(self.anchor_mf_time).max(0);
 
                     // --- Rate Control Logic ---
                     if !self.seen_first_frame {
                         // This is the very first frame we've received. Process it immediately.
-                        self.seen_first_frame = true;
-                        self.first_frame_relative_mf_time = current_relative_mf_timestamp;
-                        // Schedule the target time for the *next* frame based on this first one.
-                        self.next_target_relative_mf_timestamp = current_relative_mf_timestamp + self.frame_duration_100ns;
-
-                        // Proceed to generate this first frame
                         match self.generate_from_frame(&frame, current_relative_mf_timestamp) {
-                             Ok(sample) => return Ok(Some(sample)),
-                             Err(e) => {
-                                 eprintln!("Error generating first frame: {:?}", e);
-                                 return Err(e); // Propagate error
-                             }
-                        }
+                            Ok(sample) => {
+                                self.seen_first_frame = true;
+                                self.first_frame_relative_mf_time = current_relative_mf_timestamp;
+                                // Schedule the target time for the *next* frame.
+                                self.next_target_relative_mf_timestamp = current_relative_mf_timestamp + self.frame_duration_100ns;
+                                // Store this frame as the last processed one
+                                self.last_processed_frame = Some(frame.clone()); // Clone the frame here
+                                return Ok(Some(sample));
+                            }
+                            Err(e) => {
+                                eprintln!("Error generating first frame: {:?}", e);
+                                return Err(e); // Propagate error
+                            }
+                       }
                     } else {
                         // We have seen the first frame, now check against the schedule.
                         if current_relative_mf_timestamp >= self.next_target_relative_mf_timestamp {
@@ -470,17 +481,22 @@ impl SampleGenerator {
                             // Calculate the target time for the *next* frame based on the
                             // *current target*, not the actual frame time, to keep cadence.
                             let current_target = self.next_target_relative_mf_timestamp;
-                            self.next_target_relative_mf_timestamp = current_target + self.frame_duration_100ns;
+                            let next_target = current_target + self.frame_duration_100ns; // Schedule next frame
 
                             // Process the frame using its actual relative timestamp
-                             match self.generate_from_frame(&frame, current_relative_mf_timestamp) {
-                                 Ok(sample) => return Ok(Some(sample)),
-                                 Err(e) => {
-                                     eprintln!("Error generating frame: {:?}", e);
-                                     // Consider if error should stop generation or just skip frame
-                                     return Err(e);
-                                 }
-                            }
+                            match self.generate_from_frame(&frame, current_relative_mf_timestamp) {
+                                Ok(sample) => {
+                                    // Update the schedule for the next frame
+                                    self.next_target_relative_mf_timestamp = next_target;
+                                    // Store this frame as the last processed one
+                                    self.last_processed_frame = Some(frame.clone()); // Clone the frame here
+                                    return Ok(Some(sample));
+                                }
+                                Err(e) => {
+                                    eprintln!("Error generating frame: {:?}", e);
+                                    return Err(e);
+                                }
+                           }
                         } else {
                             // Frame arrived too early. Skip it and try getting the next one.
                             //println!("Skipping frame (arrived too early)"); // Optional debug log
@@ -489,8 +505,15 @@ impl SampleGenerator {
                     }
                 }
                 Ok(None) => {
-                    // Timeout occurred, no new frame available yet. Signal encoder to wait.
-                    return Ok(None);
+                    // --- Timeout Occurred ---
+                    println!("Timeout waiting for next frame.");
+                    
+                    // Use the extracted duplicate frame logic
+                    if let Some(sample) = self.duplicate_last_frame()? {
+                        return Ok(Some(sample));
+                    }
+                    // If we couldn't duplicate (no last frame), continue to get next frame
+                    continue;
                 }
                 Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
                     eprintln!("DXGI Access Lost in frame generation: {:?}", e);
@@ -501,6 +524,54 @@ impl SampleGenerator {
                     return Err(e); // Propagate other errors
                 }
             }
+        }
+    }
+
+    fn duplicate_last_frame(&mut self) -> Result<Option<VideoEncoderInputSample>> {
+        // Get current wall clock time
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let timestamp = format!("{:?}.{:03}s", 
+                               now.as_secs(), 
+                               now.subsec_millis());
+        
+        // Try to get a clone of the last frame, releasing the borrow on self.last_processed_frame
+        let frame_to_duplicate: Option<AcquiredFrame> =
+            if let Some(last_frame_ref) = &self.last_processed_frame {
+                Some(last_frame_ref.clone()) // Clone the frame here
+            } else {
+                None
+            };
+    
+        // Now operate based on whether we got a cloned frame
+        if let Some(cloned_last_frame) = frame_to_duplicate {
+            println!("[{}] duplicating frame", timestamp);
+            // We have a cloned frame to work with.
+            // No active borrow of self.last_processed_frame exists anymore.
+    
+            // Read the timestamp before the mutable call (doesn't strictly matter here, but good practice)
+            let duplicate_frame_timestamp = self.next_target_relative_mf_timestamp;
+    
+            println!("[{}] Duplicating last frame (cloned) for relative timestamp: {}", 
+                    timestamp, duplicate_frame_timestamp);
+    
+            // Now call generate_from_frame mutably, passing the *clone*
+            match self.generate_from_frame(&cloned_last_frame, duplicate_frame_timestamp) { // Needs &mut self
+                Ok(sample) => {
+                    // Update schedule (also needs &mut self)
+                    self.next_target_relative_mf_timestamp = duplicate_frame_timestamp + self.frame_duration_100ns;
+                    // Don't update self.last_processed_frame, it still holds the last *unique* frame.
+                    return Ok(Some(sample));
+                }
+                Err(e) => {
+                    eprintln!("[{}] Error generating duplicate frame: {:?}", timestamp, e);
+                    return Err(e); // Propagate error
+                }
+            }
+        } else {
+            // No last frame available
+            eprintln!("[{}] No last frame available to duplicate. Continuing wait...", timestamp);
+            // Return None to indicate no sample was generated
+            return Ok(None);
         }
     }
 

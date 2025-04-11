@@ -496,10 +496,7 @@ pub fn create_imf_sample_from_packet(packet: AudioDataPacket, relative_timestamp
         }
     }
     
-    // --- convert_qpc_to_mf_timespan remains the same (used by SampleWriter now) ---
     pub fn convert_qpc_to_mf_timespan(qpc_time: i64) -> Result<i64> {
-        println!("Converting QPC time: {}", qpc_time);
-        
         if qpc_time == 0 {
             println!("QPC time is 0, returning 0");
             return Ok(0);
@@ -514,7 +511,6 @@ pub fn create_imf_sample_from_packet(packet: AudioDataPacket, relative_timestamp
                 return Err(windows::core::Error::from_win32());
             }
         }
-        println!("QueryPerformanceFrequency result: {}", frequency);
     
         if frequency <= 0 {
             println!("QueryPerformanceFrequency returned non-positive frequency: {}", frequency);
@@ -526,7 +522,6 @@ pub fn create_imf_sample_from_packet(packet: AudioDataPacket, relative_timestamp
     
         // Perform calculation using i128 to avoid overflow
         let mf_time = (qpc_time as i128 * 10_000_000) / (frequency as i128);
-        println!("Calculated MF time: {}", mf_time);
         
         Ok(mf_time as i64)
     }

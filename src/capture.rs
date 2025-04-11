@@ -92,6 +92,7 @@ fn get_dxgi_output_from_hmonitor(
     }
 }
 
+#[derive(Clone)]
 pub struct AcquiredFrame {
     pub texture: ID3D11Texture2D,
     pub frame_info: DXGI_OUTDUPL_FRAME_INFO,
