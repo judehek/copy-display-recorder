@@ -204,101 +204,37 @@ impl SampleGenerator {
     }
 
     pub fn generate(&mut self) -> Result<Option<VideoEncoderInputSample>> {
-        // Loop until we find a frame that meets our timing requirements or get None
-        loop {
-            match self.frame_generator.try_get_next_frame()? {
-                Some(frame) => {
-                    // If this is our first frame, initialize timing
-                    if !self.seen_first_time_stamp {
-                        self.first_timestamp = frame.present_time;
-                        self.seen_first_time_stamp = true;
-                        // Set the next expected frame time
-                        self.next_frame_time = TimeSpan {
-                            Duration: self.first_timestamp.Duration + self.frame_period,
-                        };
-                        
-                        //println!("First frame at QPC time: {}, frame_period: {}", 
-                        //         self.first_timestamp.Duration, self.frame_period);
-                        
-                        // Process this first frame
-                        return match self.generate_from_frame(&frame) {
-                            Ok(sample) => Ok(Some(sample)),
-                            Err(err) => Err(err),
-                        };
-                    }
-                    
-                    // Calculate relative time from first frame
-                    let relative_time = TimeSpan {
-                        Duration: frame.present_time.Duration - self.first_timestamp.Duration,
-                    };
-                    
-                    let expected_time = self.next_frame_time.Duration - self.first_timestamp.Duration;
-                    
-                    // Check if this frame is at or after our expected time
-                    if relative_time.Duration >= expected_time {
-                        // Calculate timing precision metrics
-                        let time_delta = relative_time.Duration - expected_time;
-                        let time_error_ms = (time_delta as f64 * 1000.0) / self.qpc_frequency as f64;
-                        
-                        // Create a timestamp for the actual fps calculation
-                        static mut LAST_FRAME_TIME: i64 = 0;
-                        static mut FRAME_COUNT: u32 = 0;
-                        static mut TOTAL_TIME_ERROR_MS: f64 = 0.0;
-                        
-                        unsafe {
-                            // Calculate actual frame interval
-                            if LAST_FRAME_TIME > 0 {
-                                let actual_interval = frame.present_time.Duration - LAST_FRAME_TIME;
-                                let actual_frame_time_ms = (actual_interval as f64 * 1000.0) / self.qpc_frequency as f64;
-                                let target_frame_time_ms = (self.frame_period as f64 * 1000.0) / self.qpc_frequency as f64;
-                                
-                                // Update running statistics
-                                FRAME_COUNT += 1;
-                                TOTAL_TIME_ERROR_MS += time_error_ms;
-                                let avg_error_ms = TOTAL_TIME_ERROR_MS / FRAME_COUNT as f64;
-                                
-                                if FRAME_COUNT % 30 == 0 {  // Print detailed stats every 30 frames
-                                    println!("FRAME STATS: Frame #{}", FRAME_COUNT);
-                                    println!("  Target frame time: {:.2} ms", target_frame_time_ms);
-                                    println!("  Actual frame time: {:.2} ms", actual_frame_time_ms);
-                                    println!("  Current error: {:.2} ms", time_error_ms);
-                                    println!("  Average error: {:.2} ms", avg_error_ms);
-                                    println!("  Target FPS: {}", 1000.0 / target_frame_time_ms);
-                                    println!("  Actual FPS: {:.2}", 1000.0 / actual_frame_time_ms);
-                                } else {
-                                    /*println!("Frame #{}: error {:.2}ms, actual frame time: {:.2}ms", 
-                                            FRAME_COUNT, time_error_ms, actual_frame_time_ms);*/
-                                }
-                            }
-                            LAST_FRAME_TIME = frame.present_time.Duration;
-                        }
-                        
-                        // Update the next expected frame time
-                        self.next_frame_time = TimeSpan {
-                            Duration: self.next_frame_time.Duration + self.frame_period,
-                        };
-                        
-                        // Fix type mismatch by wrapping in Some
-                        return match self.generate_from_frame(&frame) {
-                            Ok(sample) => Ok(Some(sample)),
-                            Err(err) => Err(err),
-                        };
-                    } else {
-                        // This frame is too early, skip it
-                        /*println!("Skipping frame at time: {}, waiting for: {}", 
-                                relative_time.Duration, expected_time);*/
-                        
-                        // Continue loop to get next frame
-                        continue;
-                    }
-                },
-                None => {
-                    // No more frames, end capture
-                    self.stop_capture()?;
-                    return Ok(None);
-                }
+        while let Some(frame) = self.frame_generator.try_get_next_frame()? {
+            // Initialize timing on first frame
+            if !self.seen_first_time_stamp {
+                self.first_timestamp = frame.present_time;
+                self.seen_first_time_stamp = true;
+                self.next_frame_time = TimeSpan {
+                    Duration: self.first_timestamp.Duration + self.frame_period,
+                };
+                
+                return self.generate_from_frame(&frame).map(Some);
             }
+            
+            // Calculate timing relative to first frame
+            let relative_time = frame.present_time.Duration - self.first_timestamp.Duration;
+            let expected_time = self.next_frame_time.Duration - self.first_timestamp.Duration;
+            
+            // Check if this frame meets our timing requirements
+            if relative_time >= expected_time {
+
+                // Update next expected frame time
+                self.next_frame_time.Duration += self.frame_period;
+                
+                return self.generate_from_frame(&frame).map(Some);
+            }
+            
+            // Frame is too early, skip it and continue loop
         }
+        
+        // No more frames, end capture
+        self.stop_capture()?;
+        Ok(None)
     }
 
     fn stop_capture(&mut self) -> Result<()> {
@@ -420,7 +356,7 @@ impl SampleWriter {
     pub fn write(&self, sample: &IMFSample) -> Result<()> {
         // Get the sample time directly
         unsafe {
-            let time = sample.GetSampleTime()?;
+            //let time = sample.GetSampleTime()?;
             //println!("Sample time: {}", time);
             
             // Write the sample to the sink
