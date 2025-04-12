@@ -1,91 +1,51 @@
-use std::time::Duration;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use windows::Foundation::TimeSpan;
+use windows::Win32::System::Performance::QueryPerformanceCounter;
 use windows::{
     core::{ComInterface, Result},
     Win32::{
-        Foundation::RECT,
+        Foundation::{E_FAIL, RECT},
         Graphics::{
-            Direct3D11::{ID3D11Device, ID3D11Texture2D, D3D11_CPU_ACCESS_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING},
+            Direct3D11::{ID3D11Device, ID3D11Texture2D, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT},
             Dxgi::{
-                IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC, DXGI_RESOURCE_PRIORITY_MAXIMUM
+                IDXGIAdapter, IDXGIDevice, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication, IDXGIResource, 
+                DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_NOT_FOUND, DXGI_ERROR_WAIT_TIMEOUT, 
+                DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTPUT_DESC
             },
             Gdi::HMONITOR,
         },
     },
 };
 
-
-pub struct FrameAnalysisResult {
-    pub is_black: bool,
-    pub non_black_percentage: f32,
-    pub max_brightness: u8,
-    pub sample_pixels: Vec<(u32, u32, [u8; 3])>, // Coordinates and RGB values
-    pub analyzed_pixels: u32,
-}
-
 // Helper function to get IDXGIOutput1 from HMONITOR
 fn get_dxgi_output_from_hmonitor(
     d3d_device: &ID3D11Device,
     monitor_handle: HMONITOR,
 ) -> Result<IDXGIOutput1> {
-    println!("Entering get_dxgi_output_from_hmonitor");
-    
-    let dxgi_device: IDXGIDevice = match d3d_device.cast() {
-        Ok(device) => {
-            println!("Successfully cast to IDXGIDevice");
-            device
-        },
-        Err(e) => {
-            println!("Failed to cast to IDXGIDevice: {:?}", e);
-            return Err(e);
-        }
-    };
-    
-    let adapter: IDXGIAdapter = match unsafe { dxgi_device.GetAdapter() } {
-        Ok(adapter) => {
-            println!("Successfully got IDXGIAdapter");
-            adapter
-        },
-        Err(e) => {
-            println!("Failed to get adapter: {:?}", e);
-            return Err(e);
-        }
-    };
+    let dxgi_device: IDXGIDevice = d3d_device.cast()?;
+    let adapter: IDXGIAdapter = unsafe { dxgi_device.GetAdapter()? };
 
     let mut output_index = 0;
     loop {
-        println!("Trying to enumerate output {}", output_index);
         let output: IDXGIOutput = match unsafe { adapter.EnumOutputs(output_index) } {
-            Ok(output) => {
-                println!("Successfully got output {}", output_index);
-                output
-            },
+            Ok(output) => output,
             Err(err) if err.code() == DXGI_ERROR_NOT_FOUND => {
-                println!("No more outputs found at index {}", output_index);
                 return Err(windows::core::Error::new(
                     DXGI_ERROR_ACCESS_LOST,
                     "Monitor not found on adapter".into(),
                 ));
             }
-            Err(err) => {
-                println!("Error enumerating output {}: {:?}", output_index, err);
-                return Err(err.into());
-            }
+            Err(err) => return Err(err),
         };
 
         let mut desc: DXGI_OUTPUT_DESC = Default::default();
-        match unsafe { output.GetDesc(&mut desc) } {
-            Ok(_) => {
-                println!("Got output description for output {}", output_index);
-                if desc.Monitor == monitor_handle {
-                    println!("Found matching monitor at output index {}", output_index);
-                    return output.cast();
-                }
-            },
-            Err(e) => {
-                println!("Failed to get output description: {:?}", e);
-                return Err(e);
-            }
+        unsafe { output.GetDesc(&mut desc)? };
+        
+        if desc.Monitor == monitor_handle {
+            return output.cast();
         }
 
         output_index += 1;
@@ -96,14 +56,54 @@ fn get_dxgi_output_from_hmonitor(
 pub struct AcquiredFrame {
     pub texture: ID3D11Texture2D,
     pub frame_info: DXGI_OUTDUPL_FRAME_INFO,
+    pub present_time: TimeSpan,
+}
+
+// Mimics GraphicsCaptureSession from the Windows API
+pub struct CustomGraphicsCaptureSession {
+    sender: Sender<bool>, // To signal start/stop
+    running: bool,
+}
+
+impl CustomGraphicsCaptureSession {
+    fn new(sender: Sender<bool>) -> Self {
+        Self {
+            sender,
+            running: false,
+        }
+    }
+
+    pub fn StartCapture(&mut self) -> Result<()> {
+        if !self.running {
+            self.sender.send(true).map_err(|_| windows::core::Error::from(E_FAIL))?;
+            self.running = true;
+        }
+        Ok(())
+    }
+
+    pub fn Close(&mut self) -> Result<()> {
+        if self.running {
+            self.sender.send(false).map_err(|_| windows::core::Error::from(E_FAIL))?;
+            self.running = false;
+        }
+        Ok(())
+    }
+}
+
+impl Clone for CustomGraphicsCaptureSession {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            running: self.running,
+        }
+    }
 }
 
 pub struct CaptureFrameGenerator {
-    _d3d_device: ID3D11Device,
-    duplication: IDXGIOutputDuplication,
-    buffer_texture: Option<ID3D11Texture2D>,
-    width: u32,
-    height: u32,
+    d3d_device: ID3D11Device,
+    sender: Sender<Option<AcquiredFrame>>,
+    receiver: Receiver<Option<AcquiredFrame>>,
+    session: CustomGraphicsCaptureSession,
 }
 
 impl CaptureFrameGenerator {
@@ -111,280 +111,245 @@ impl CaptureFrameGenerator {
         d3d_device: ID3D11Device,
         monitor_handle: HMONITOR,
     ) -> Result<Self> {
-        println!("Getting DXGI output from monitor handle");
-        let output = get_dxgi_output_from_hmonitor(&d3d_device, monitor_handle)?;
-        println!("Successfully got DXGI output");
+        // Create channels for frames and control
+        let (frame_sender, frame_receiver) = channel();
+        let (control_sender, control_receiver) = channel();
+
+        let frame_sender_for_struct = frame_sender.clone();
         
-        println!("Attempting to duplicate output");
-        let duplication_result = unsafe { output.DuplicateOutput(&d3d_device) };
-        match &duplication_result {
-            Ok(_) => println!("Successfully duplicated output"),
-            Err(e) => {
-                eprintln!("Failed to duplicate output: {:?}. Ensure monitor supports duplication.", e);
-                return Err(e.clone());
-            }
-        }
-        let duplication = duplication_result?;
-        println!("Successfully duplicated output");
+        // Create session
+        let session = CustomGraphicsCaptureSession::new(control_sender.clone());
+        
+        // Get output and create duplication
+        let output = get_dxgi_output_from_hmonitor(&d3d_device, monitor_handle)?;
+        let duplication = unsafe { output.DuplicateOutput(&d3d_device)? };
         
         // Get output dimensions
-        println!("Getting output description");
         let mut desc: DXGI_OUTPUT_DESC = Default::default();
-        let desc_result = unsafe { output.GetDesc(&mut desc) };
-        match &desc_result {
-            Ok(_) => println!("Get output description succeeded"),
-            Err(e) => println!("Get output description failed with error: {:?}", e),
-        }
-        desc_result?;
+        unsafe { output.GetDesc(&mut desc)? };
         
-        let width = (desc.DesktopCoordinates.right - desc.DesktopCoordinates.left) as u32;
-        let height = (desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top) as u32;
-        println!("Output dimensions: {}x{}", width, height);
-
-        Ok(Self {
-            _d3d_device: d3d_device,
-            duplication,
-            buffer_texture: None,
-            width,
-            height,
-        })
-    }
-
-    pub fn resolution(&self) -> (u32, u32) {
-        (self.width, self.height)
-    }
-
-    // Timeout is in milliseconds
-    pub fn try_get_next_frame(&mut self, timeout_ms: u32) -> Result<Option<AcquiredFrame>> {
-        let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = Default::default();
-        let mut desktop_resource: Option<IDXGIResource> = None;
-    
-        let acquire_result = unsafe {
-            self.duplication
-                .AcquireNextFrame(timeout_ms, &mut frame_info, &mut desktop_resource)
-        };
-    
-        match acquire_result {
-            Ok(_) => {
-                let desktop_resource = desktop_resource
-                    .expect("AcquireNextFrame succeeded but returned null resource");
-
-                let acquired_texture: ID3D11Texture2D = desktop_resource.cast()?;
-    
-                // Ensure buffer_texture exists and matches description
-                let source_desc = {
-                    let mut desc = D3D11_TEXTURE2D_DESC::default();
-                    unsafe { acquired_texture.GetDesc(&mut desc) };
-                    desc
-                };
-                let buffer_desc = D3D11_TEXTURE2D_DESC {
-                    Width: source_desc.Width,
-                    Height: source_desc.Height,
-                    MipLevels: 1,
-                    ArraySize: 1,
-                    Format: source_desc.Format,
-                    SampleDesc: source_desc.SampleDesc,
-                    Usage: D3D11_USAGE_DEFAULT,
-                    BindFlags: 0,
-                    CPUAccessFlags: 0,
-                    MiscFlags: 0,
-                    ..Default::default()
-                };
-    
-                // Create or reuse buffer_texture
-                let target_texture = match &self.buffer_texture {
-                    Some(buffer) => {
-                        buffer
+        // Clone necessary values for the capture thread
+        let d3d_device_clone = d3d_device.clone();
+        
+        // Start background thread to poll for frames
+        thread::spawn(move || {
+            let mut running = false;
+            let mut buffer_texture: Option<ID3D11Texture2D> = None;
+            let mut last_texture: Option<ID3D11Texture2D> = None; // Track last texture for duplication
+            
+            'outer: loop {
+                // Check for control messages first
+                match control_receiver.try_recv() {
+                    Ok(start_signal) => {
+                        running = start_signal;
+                        if !running {
+                            // Signal end of capture
+                            let _ = frame_sender.send(None);
+                            break;
+                        }
+                    },
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        // No control messages, continue
+                    },
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break; // Exit if channel is closed
                     }
-                    None => {
-                        println!("Creating buffer texture for captured frame copy.");
-                        let buffer = unsafe {
-                             let mut texture = None;
-                             self._d3d_device.CreateTexture2D(&buffer_desc, None, Some(&mut texture))?;
-                             texture.unwrap()
-                        };
-                        self.buffer_texture = Some(buffer);
-                        self.buffer_texture.as_ref().unwrap()
-                    }
-                };
-                println!("test");
-
-                // Get context and copy
-                let context = unsafe { self._d3d_device.GetImmediateContext()? };
-                unsafe { context.CopyResource(target_texture, &acquired_texture) };
-    
-                // Release frame
-                unsafe { self.duplication.ReleaseFrame()? };
-    
-                // Return the cloned handle to our owned buffer texture
-                Ok(Some(AcquiredFrame {
-                    texture: target_texture.clone(), // Clone increases ref count
-                    frame_info,
-                }))
-            }
-            Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                Ok(None)
-            }
-            Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => {
-                println!("ERROR: Access lost to desktop duplication: {:?}", err);
-                Err(err.into())
-            }
-            Err(err) => {
-                println!("ERROR: Failed to acquire frame: {:?}", err);
-                Err(err.into())
-            }
-        }
-    }
-    
-    pub fn analyze_frame(&self, texture: &ID3D11Texture2D) -> Result<FrameAnalysisResult> {
-        // Get the D3D11 device and immediate context
-        let device = &self._d3d_device;
-        let context = unsafe { device.GetImmediateContext() }.unwrap();
-    
-        // Create a staging texture that we can read from CPU
-        let mut texture_desc = unsafe { std::mem::zeroed::<D3D11_TEXTURE2D_DESC>() };
-        unsafe { texture.GetDesc(&mut texture_desc) };
-        
-        // Modify the description for our staging texture
-        texture_desc.Usage = D3D11_USAGE_STAGING;
-        texture_desc.BindFlags = 0;
-        texture_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
-        texture_desc.MiscFlags = 0;
-    
-        // Create the staging texture
-        let staging_texture = unsafe {
-            let mut texture_out = None;
-            let result = device.CreateTexture2D(
-                &texture_desc, 
-                None, 
-                Some(&mut texture_out)
-            );
-            
-            if result.is_err() {
-                println!("Failed to create staging texture: {:?}", result);
-                return Err(result.unwrap_err());
-            }
-            
-            texture_out.unwrap()
-        };
-    
-        // Copy the frame texture to our staging texture
-        unsafe { context.CopyResource(&staging_texture, texture) };
-    
-        // Map the staging texture to get access to its data
-        let mut mapped_resource = unsafe { std::mem::zeroed::<D3D11_MAPPED_SUBRESOURCE>() };
-        let map_result = unsafe {
-            context.Map(
-                &staging_texture,
-                0, // Subresource index
-                D3D11_MAP_READ,
-                0, // MapFlags
-                Some(&mut mapped_resource),
-            )
-        };
-        
-        if map_result.is_err() {
-            println!("Failed to map texture: {:?}", map_result);
-            return Err(map_result.unwrap_err());
-        }
-    
-        // Analyze the pixel data
-        let analysis = unsafe {
-            let row_pitch = mapped_resource.RowPitch;
-            let data_ptr = mapped_resource.pData as *const u8;
-            
-            let mut is_black = true;
-            let mut non_black_count = 0;
-            let mut max_brightness = 0u8;
-            let mut sample_pixels = Vec::new();
-            let sample_step = 16; // Check every Nth pixel for performance
-            let mut analyzed_pixels = 0;
-            
-            for y in 0..texture_desc.Height {
-                if y % sample_step != 0 {
+                }
+                
+                if !running {
+                    thread::sleep(Duration::from_millis(10));
                     continue;
                 }
                 
-                let row_start = data_ptr.add((y * row_pitch) as usize);
+                // Try to get a frame with timeout
+                let mut frame_info: DXGI_OUTDUPL_FRAME_INFO = Default::default();
+                let mut desktop_resource: Option<IDXGIResource> = None;
                 
-                for x in 0..texture_desc.Width {
-                    if x % sample_step != 0 {
-                        continue;
-                    }
-                    
-                    analyzed_pixels += 1;
-                    let pixel_offset = (x * 4) as usize; // 4 bytes per pixel
-                    let pixel = row_start.add(pixel_offset);
-                    
-                    // BGRA format - B, G, R values at offsets 0, 1, 2
-                    let b = *pixel;
-                    let g = *pixel.add(1);
-                    let r = *pixel.add(2);
-                    
-                    // Calculate max brightness across RGB channels
-                    let brightness = b.max(g).max(r);
-                    max_brightness = max_brightness.max(brightness);
-                    
-                    // Check if pixel is non-black (allowing for some near-black noise)
-                    if brightness > 5 { // Threshold for "black enough"
-                        is_black = false;
-                        non_black_count += 1;
+                let acquire_result = unsafe {
+                    duplication.AcquireNextFrame(0, &mut frame_info, &mut desktop_resource)
+                };
+                
+                match acquire_result {
+                    Ok(_) => {
+                        let desktop_resource = desktop_resource
+                            .expect("AcquireNextFrame succeeded but returned null resource");
                         
-                        // Store some samples for debugging (up to 10)
-                        if sample_pixels.len() < 10 {
-                            sample_pixels.push((x, y, [r, g, b]));
+                        let acquired_texture: ID3D11Texture2D = match desktop_resource.cast() {
+                            Ok(texture) => texture,
+                            Err(e) => {
+                                eprintln!("Failed to cast resource to texture: {:?}", e);
+                                unsafe { duplication.ReleaseFrame().unwrap_or_default() };
+                                continue;
+                            }
+                        };
+                        
+                        // Create or reuse buffer texture for copying
+                        let source_desc = {
+                            let mut desc = D3D11_TEXTURE2D_DESC::default();
+                            unsafe { acquired_texture.GetDesc(&mut desc) };
+                            desc
+                        };
+                        
+                        let buffer_desc = D3D11_TEXTURE2D_DESC {
+                            Width: source_desc.Width,
+                            Height: source_desc.Height,
+                            MipLevels: 1,
+                            ArraySize: 1,
+                            Format: source_desc.Format,
+                            SampleDesc: source_desc.SampleDesc,
+                            Usage: D3D11_USAGE_DEFAULT,
+                            BindFlags: 0,
+                            CPUAccessFlags: 0,
+                            MiscFlags: 0,
+                            ..Default::default()
+                        };
+                        
+                        let target_texture = match &buffer_texture {
+                            Some(texture) => texture.clone(),
+                            None => {
+                                let new_texture = unsafe {
+                                    let mut texture = None;
+                                    match d3d_device_clone.CreateTexture2D(&buffer_desc, None, Some(&mut texture)) {
+                                        Ok(_) => texture.unwrap(),
+                                        Err(e) => {
+                                            eprintln!("Failed to create buffer texture: {:?}", e);
+                                            unsafe { duplication.ReleaseFrame().unwrap_or_default() };
+                                            continue;
+                                        }
+                                    }
+                                };
+                                buffer_texture = Some(new_texture.clone());
+                                new_texture
+                            }
+                        };
+                        
+                        // Copy the acquired frame to our buffer
+                        let context = match unsafe { d3d_device_clone.GetImmediateContext() } {
+                            Ok(ctx) => ctx,
+                            Err(e) => {
+                                eprintln!("Failed to get immediate context: {:?}", e);
+                                continue;
+                            }
+                        };
+                        unsafe { context.CopyResource(&target_texture, &acquired_texture) };
+                        
+                        // Release the frame back to duplication
+                        if let Err(e) = unsafe { duplication.ReleaseFrame() } {
+                            eprintln!("Failed to release frame: {:?}", e);
+                            continue;
                         }
+                        
+                        // Get our own QPC timestamp
+                        let present_time = match get_qpc_timestamp() {
+                            Ok(timestamp) => timestamp,
+                            Err(e) => {
+                                eprintln!("Failed to get QPC timestamp: {:?}", e);
+                                continue;
+                            }
+                        };
+                        
+                        // Create and send the frame
+                        let frame = AcquiredFrame {
+                            texture: target_texture.clone(),
+                            frame_info,
+                            present_time,
+                        };
+                        
+                        // Store this texture for duplication in case of timeout
+                        last_texture = Some(target_texture);
+                        
+                        if frame_sender.send(Some(frame)).is_err() {
+                            break 'outer; // Exit if channel is closed
+                        }
+                    },
+                    Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                        // No new frame available - use last frame with a new timestamp if we have one
+                        if let Some(last_tex) = &last_texture {
+                            // Get a new QPC timestamp
+                            let present_time = match get_qpc_timestamp() {
+                                Ok(timestamp) => timestamp,
+                                Err(e) => {
+                                    eprintln!("Failed to get QPC timestamp for duplicate frame: {:?}", e);
+                                    thread::sleep(Duration::from_millis(1));
+                                    continue;
+                                }
+                            };
+                            
+                            // Create a duplicate frame with the new timestamp
+                            let frame = AcquiredFrame {
+                                texture: last_tex.clone(),
+                                frame_info: Default::default(), // Default frame info for duplicate
+                                present_time,
+                            };
+                            
+                            if frame_sender.send(Some(frame)).is_err() {
+                                break 'outer;
+                            }
+                        
+                            // IMPORANT: prevent busy wait due to 0 timeout on acquirenextframe()
+                            thread::sleep(Duration::from_millis(1));
+                        } else {
+                            // No last texture yet, just wait a bit
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    },
+                    Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => {
+                        // Critical error, signal end of capture
+                        let _ = frame_sender.send(None);
+                        break;
+                    },
+                    Err(err) => {
+                        // Log other errors but continue
+                        eprintln!("Error acquiring frame: {:?}", err);
                     }
                 }
             }
-            
-            // Calculate non-black percentage based on our sampling
-            let non_black_percentage = if analyzed_pixels > 0 {
-                (non_black_count as f32 / analyzed_pixels as f32) * 100.0
-            } else {
-                0.0
-            };
-            
-            // Unmap when done
-            context.Unmap(&staging_texture, 0);
-            
-            FrameAnalysisResult {
-                is_black,
-                non_black_percentage,
-                max_brightness,
-                sample_pixels,
-                analyzed_pixels,
-            }
-        };
-    
-        Ok(analysis)
+        });
+
+        Ok(Self {
+            d3d_device,
+            sender: frame_sender_for_struct,
+            receiver: frame_receiver,
+            session,
+        })
     }
 
-    // Optional: Provide a blocking version
-    pub fn get_next_frame(&mut self) -> Result<AcquiredFrame> {
-        loop {
-            match self.try_get_next_frame(u32::MAX) { // Use a very long timeout for blocking
-                Ok(Some(frame)) => return Ok(frame),
-                Ok(None) => continue, // Should not happen with infinite timeout, but handle defensively
-                Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                    // Handle lost access, maybe try to reinitialize or return error
-                    return Err(e);
-                }
-                Err(e) => return Err(e), // Propagate other errors
+    pub fn session(&self) -> &CustomGraphicsCaptureSession {
+        &self.session
+    }
+
+    // Simplified function that just receives from the channel
+    pub fn try_get_next_frame(&mut self) -> Result<Option<AcquiredFrame>> {
+        match self.receiver.recv() {
+            Ok(Some(frame)) => {
+                Ok(Some(frame))
+            },
+            Ok(None) => {
+                // End of capture signal
+                Ok(None)
+            },
+            Err(_) => {
+                // Channel closed, end of capture
+                Ok(None)
             }
         }
     }
 
-    // The stop signal mechanism is removed as Desktop Duplication doesn't use callbacks.
-    // Stopping is handled by dropping the CaptureFrameGenerator.
-}
-
-impl Drop for CaptureFrameGenerator {
-    fn drop(&mut self) {
-        // IDXGIOutputDuplication is released automatically when dropped
-        // No explicit Close needed like Graphics Capture
-        println!("Dropping CaptureFrameGenerator and releasing duplication.");
+    pub fn stop_capture(&mut self) -> Result<()> {
+        self.session.Close()
     }
 }
 
-// Remove CaptureFrameGeneratorStopSignal as it's no longer needed
+fn get_qpc_timestamp() -> Result<TimeSpan> {
+    let mut qpc_timestamp: i64 = 0;
+    unsafe {
+        QueryPerformanceCounter(&mut qpc_timestamp)?;
+    }
+    
+    // Create a TimeSpan using the same pattern as your example
+    let timestamp = TimeSpan {
+        Duration: qpc_timestamp,
+    };
+    
+    Ok(timestamp)
+}
