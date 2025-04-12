@@ -1,6 +1,6 @@
 use clap::{value_parser, Parser, Subcommand};
 
-use crate::{audio::AudioSource, resolution::Resolution, video::backend::EncoderBackend};
+use crate::resolution::Resolution;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -40,17 +40,6 @@ pub struct Args {
     /// Recording immediately starts. End the recording through console input.
     #[clap(long)]
     pub console_mode: bool,
-
-    /// The backend to use for the video encoder.
-    #[clap(long, default_value_t = EncoderBackend::MediaFoundation)]
-    pub backend: EncoderBackend,
-
-    #[clap(
-        long,
-        value_parser = value_parser!(AudioSource), // Explicitly use the parser for the enum
-        default_value = "none" // Provide the default as a string literal
-    )]
-    pub audio_source: AudioSource,
     
     /// The output file that will contain the recording.
     #[clap(default_value = "recording.mp4")]

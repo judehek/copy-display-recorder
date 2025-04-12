@@ -1,6 +1,6 @@
 use windows::core::{ComInterface, Interface, Result};
 use windows::Graphics::DirectX::Direct3D11::{IDirect3DDevice, IDirect3DSurface};
-use windows::Win32::Graphics::Direct3D11::{ID3D11Texture2D, D3D11_CREATE_DEVICE_DEBUG};
+use windows::Win32::Graphics::Direct3D11::{ID3D11Multithread, ID3D11Texture2D, D3D11_CREATE_DEVICE_DEBUG};
 use windows::Win32::Graphics::Dxgi::IDXGISurface;
 use windows::Win32::Graphics::{
     Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP},
@@ -52,6 +52,17 @@ pub fn create_d3d_device() -> Result<ID3D11Device> {
     }
     result?;
     Ok(device.unwrap())
+}
+
+pub fn set_multithread_protected(d3d_device: &ID3D11Device, enable: bool) -> Result<bool> {
+    // Cast the device to the ID3D11Multithread interface
+    let multithread: ID3D11Multithread = d3d_device.cast()?;
+    
+    // Call SetMultithreadProtected with the provided boolean value directly
+    // This returns true if multithread protection was already enabled
+    let was_protected = unsafe { multithread.SetMultithreadProtected(enable) };
+    
+    Ok(was_protected.into())
 }
 
 pub fn create_direct3d_device(d3d_device: &ID3D11Device) -> Result<IDirect3DDevice> {

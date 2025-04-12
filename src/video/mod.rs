@@ -1,6 +1,4 @@
-pub mod backend;
+pub mod encoder;
+pub mod encoder_device;
 pub mod encoding_session;
-pub mod mf;
-mod util;
-
-const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+mod processor;
