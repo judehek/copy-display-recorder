@@ -6,16 +6,17 @@ mod hotkey;
 mod media;
 mod resolution;
 mod video;
-mod audio;
+mod old_audio;
 mod window_detector;
+mod audio;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool};
 
 use std::{path::Path, time::Duration};
 
 use args::Args;
-use audio::AudioSource;
+use old_audio::AudioSource;
 use clap::Parser;
 use d3d::set_multithread_protected;
 use hotkey::HotKey;
@@ -145,6 +146,9 @@ fn run(
 
     let is_recording_window = Arc::new(AtomicBool::new(true));
     let hook = window_detector::start_window_change_detector(is_recording_window.clone());
+
+    // setup audio capture
+    //TODO: 
 
     // Start the recording
     {

@@ -8,6 +8,7 @@ resolver = "2"
 
 [dependencies]
 clap = { version = "4.4.3", features = ["derive"] }
+ringbuf = "0.4.8"
 
 [dependencies.windows]
 version = "0.51.1"
