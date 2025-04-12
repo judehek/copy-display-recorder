@@ -47,13 +47,8 @@ struct SampleGenerator {
 
     frame_generator: CaptureFrameGenerator,
 
-    frame_duration_100ns: i64,
-    anchor_mf_time: i64,
-
-    seen_first_frame: bool,
-    first_frame_relative_mf_time: i64,
-    next_target_relative_mf_timestamp: i64,
-    last_processed_frame: Option<AcquiredFrame>,
+    seen_first_time_stamp: bool,
+    first_timestamp: TimeSpan,
 }
 
 pub struct SampleWriter {
@@ -90,7 +85,6 @@ impl VideoEncodingSession {
             monitor_handle,
             input_size, 
             output_size,
-            frame_rate
         )?;
         let capture_session = sample_generator.capture_session().clone();
         video_encoder.set_sample_requested_callback(
@@ -131,7 +125,6 @@ impl SampleGenerator {
         monitor_handle: HMONITOR,
         input_size: SizeInt32,
         output_size: SizeInt32,
-        frame_rate: u32,
     ) -> Result<Self> {
         let d3d_context = unsafe { d3d_device.GetImmediateContext()? };
 
@@ -173,20 +166,6 @@ impl SampleGenerator {
         // Create frame generator
         let frame_generator = CaptureFrameGenerator::new(d3d_device.clone(), monitor_handle)?;
 
-        // Calculate frame duration in 100ns units (used by Media Foundation)
-        let frame_duration_100ns = (10_000_000 / frame_rate) as i64;
-
-        // Get initial timestamp
-        let mut freq = 0i64;
-        let mut counter = 0i64;
-        unsafe {
-            QueryPerformanceFrequency(&mut freq);
-            QueryPerformanceCounter(&mut counter);
-        }
-
-        // Convert QPC to 100ns units for Media Foundation
-        let anchor_mf_time = (counter as f64 * 10_000_000.0 / freq as f64) as i64;
-
         Ok(Self {
             d3d_device,
             d3d_context,
@@ -197,13 +176,8 @@ impl SampleGenerator {
 
             frame_generator,
 
-            frame_duration_100ns,
-            anchor_mf_time,
-
-            seen_first_frame: false,
-            first_frame_relative_mf_time: 0,
-            next_target_relative_mf_timestamp: 0,
-            last_processed_frame: None,
+            seen_first_time_stamp: false,
+            first_timestamp: TimeSpan::default(),
         })
     }
 
@@ -212,76 +186,45 @@ impl SampleGenerator {
     }
 
     pub fn generate(&mut self) -> Result<Option<VideoEncoderInputSample>> {
-        println!("Entering generate() function");
-        match self.frame_generator.try_get_next_frame() {
-            Ok(Some(frame)) => {
-                // Calculate timestamp for this frame
-                let current_time_us = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros() as i64;
-                    
-                let current_relative_mf_timestamp = 
-                    ((current_time_us - (self.anchor_mf_time / 10)) * 10) as i64;
-                
-                println!("Current relative MF timestamp: {}", current_relative_mf_timestamp);
-                
-                if !self.seen_first_frame {
-                    println!("Processing first frame");
-                    // First frame - use its timestamp directly
-                    match self.generate_from_frame(&frame, current_relative_mf_timestamp) {
-                        Ok(sample) => {
-                            println!("First frame processed successfully");
-                            self.seen_first_frame = true;
-                            self.first_frame_relative_mf_time = current_relative_mf_timestamp;
-                            self.next_target_relative_mf_timestamp = 
-                                current_relative_mf_timestamp + self.frame_duration_100ns;
-                            println!("Next target timestamp: {}", self.next_target_relative_mf_timestamp);
-                            self.last_processed_frame = Some(frame);
-                            Ok(Some(sample))
-                        }
-                        Err(e) => {
-                            println!("Error processing first frame: {:?}", e);
-                            Err(e)
-                        }
-                    }
-                } else {
-                    // Use scheduled timestamp for smooth frame rate
-                    let timestamp_to_use = self.next_target_relative_mf_timestamp;
-                    println!("Processing subsequent frame with timestamp: {}", timestamp_to_use);
-                    match self.generate_from_frame(&frame, timestamp_to_use) {
-                        Ok(sample) => {
-                            self.next_target_relative_mf_timestamp += self.frame_duration_100ns;
-                            println!("Updated next target timestamp: {}", self.next_target_relative_mf_timestamp);
-                            self.last_processed_frame = Some(frame);
-                            Ok(Some(sample))
-                        }
-                        Err(e) => {
-                            println!("Error processing frame: {:?}", e);
-                            Err(e)
-                        }
-                    }
+        if let Some(frame) = self.frame_generator.try_get_next_frame()? {
+            let result = self.generate_from_frame(&frame);
+            match result {
+                Ok(sample) => Ok(Some(sample)),
+                Err(error) => {
+                    eprintln!(
+                        "Error during input sample generation: {:?} - {}",
+                        error.code(),
+                        error.message()
+                    );
+                    self.stop_capture()?;
+                    Ok(None)
                 }
             }
-            Ok(None) => {
-                // End of capture signaled
-                println!("End of capture signaled");
-                Ok(None)
-            }
-            Err(e) => {
-                eprintln!("Error getting next frame: {:?}", e);
-                Err(e)
-            }
+        } else {
+            self.stop_capture()?;
+            Ok(None)
         }
+    }
+
+    fn stop_capture(&mut self) -> Result<()> {
+        self.frame_generator.stop_capture()
     }
     
     fn generate_from_frame(
         &mut self,
         frame: &AcquiredFrame,
-        relative_mf_timestamp: i64,
     ) -> Result<VideoEncoderInputSample> {
-        println!("Entering generate_from_frame with timestamp: {}", relative_mf_timestamp);
         let frame_texture = &frame.texture;
+        let frame_time = frame.present_time;
+
+        if !self.seen_first_time_stamp {
+            self.first_timestamp = frame_time;
+            self.seen_first_time_stamp = true;
+        }
+
+        let timestamp = TimeSpan {
+            Duration: frame_time.Duration - self.first_timestamp.Duration,
+        };
     
         // Determine region to copy
         let desc = unsafe {
@@ -289,17 +232,14 @@ impl SampleGenerator {
             frame_texture.GetDesc(&mut desc);
             desc
         };
-        println!("Frame dimensions: {}x{}", desc.Width, desc.Height);
         let region = D3D11_BOX {
             left: 0, right: desc.Width, top: 0, bottom: desc.Height, back: 1, front: 0,
         };
     
         // GPU Processing
         unsafe {
-            println!("Starting GPU processing");
             // Clear render target
             self.d3d_context.ClearRenderTargetView(&self.render_target_view, &CLEAR_COLOR);
-            println!("Cleared render target");
     
             // Copy the captured frame to composition texture
             self.d3d_context.CopySubresourceRegion(
@@ -308,16 +248,13 @@ impl SampleGenerator {
                 frame_texture,
                 0, Some(&region),
             );
-            println!("Copied frame to composition texture");
     
             // Process BGRA -> NV12
             // Fix: Call the function directly and use ? afterward
             self.video_processor.process_texture(&self.compose_texture)?;
-            println!("BGRA to NV12 conversion successful");
     
             // Get the resulting NV12 texture
             let video_output_texture = self.video_processor.output_texture();
-            println!("Got output NV12 texture");
     
             // Create a new texture for the sample
             let sample_texture = {
@@ -326,27 +263,19 @@ impl SampleGenerator {
                      video_output_texture.GetDesc(&mut desc);
                      desc
                  };
-                 println!("Output texture dimensions: {}x{}", output_desc.Width, output_desc.Height);
                  
                  // Fix: Call the function directly and use ? afterward
                  let mut texture = None;
                  self.d3d_device.CreateTexture2D(&output_desc, None, Some(&mut texture))?;
-                 println!("Created sample texture successfully");
                  texture.unwrap()
             };
             
             // Copy the processed texture to the sample texture
             self.d3d_context.CopyResource(&sample_texture, video_output_texture);
-            println!("Copied processed texture to sample texture");
-    
-            // Create TimeSpan for the sample
-            let relative_timespan = TimeSpan { Duration: relative_mf_timestamp };
-            println!("Created TimeSpan with duration: {}", relative_mf_timestamp);
     
             // Create and return the input sample
-            println!("Creating and returning VideoEncoderInputSample");
             Ok(VideoEncoderInputSample::new(
-                relative_timespan,
+                timestamp,
                 sample_texture,
             ))
         }
@@ -394,7 +323,12 @@ impl SampleWriter {
     }
 
     pub fn write(&self, sample: &IMFSample) -> Result<()> {
+        // Get the sample time directly
         unsafe {
+            let time = sample.GetSampleTime()?;
+            println!("Sample time: {}", time);
+            
+            // Write the sample to the sink
             self.sink_writer
                 .WriteSample(self.sink_writer_stream_index, sample)
         }

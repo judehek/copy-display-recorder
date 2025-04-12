@@ -44,10 +44,6 @@ impl VideoEncoderInputSample {
     pub fn new(timestamp: TimeSpan, texture: ID3D11Texture2D) -> Self {
         Self { timestamp, texture }
     }
-
-    pub fn texture(&self) -> &ID3D11Texture2D {
-        &self.texture
-    }
 }
 
 pub struct VideoEncoderOutputSample {

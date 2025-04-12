@@ -2,6 +2,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
+use windows::Foundation::TimeSpan;
+use windows::Win32::System::Performance::QueryPerformanceCounter;
 use windows::{
     core::{ComInterface, Result},
     Win32::{
@@ -56,6 +58,7 @@ fn get_dxgi_output_from_hmonitor(
 pub struct AcquiredFrame {
     pub texture: ID3D11Texture2D,
     pub frame_info: DXGI_OUTDUPL_FRAME_INFO,
+    pub present_time: TimeSpan,
 }
 
 // Mimics GraphicsCaptureSession from the Windows API
@@ -143,6 +146,7 @@ impl CaptureFrameGenerator {
             let mut running = false;
             let mut buffer_texture: Option<ID3D11Texture2D> = None;
             let mut frame_count = 0;
+            let mut last_texture: Option<ID3D11Texture2D> = None; // Track last texture for duplication
             
             'outer: loop {
                 // Check for control messages first
@@ -251,7 +255,6 @@ impl CaptureFrameGenerator {
                             Ok(ctx) => ctx,
                             Err(e) => {
                                 eprintln!("Failed to get immediate context: {:?}", e);
-                                // Either continue the loop, break, or take another appropriate action
                                 continue;
                             }
                         };
@@ -263,11 +266,24 @@ impl CaptureFrameGenerator {
                             continue;
                         }
                         
+                        // Get our own QPC timestamp
+                        let present_time = match get_qpc_timestamp() {
+                            Ok(timestamp) => timestamp,
+                            Err(e) => {
+                                eprintln!("Failed to get QPC timestamp: {:?}", e);
+                                continue;
+                            }
+                        };
+                        
                         // Create and send the frame
                         let frame = AcquiredFrame {
-                            texture: target_texture,
+                            texture: target_texture.clone(),
                             frame_info,
+                            present_time,
                         };
+                        
+                        // Store this texture for duplication in case of timeout
+                        last_texture = Some(target_texture);
                         
                         if frame_sender.send(Some(frame)).is_err() {
                             println!("Failed to send frame, receiver disconnected");
@@ -275,8 +291,33 @@ impl CaptureFrameGenerator {
                         }
                     },
                     Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                        // No frame available, just continue
-                        thread::sleep(Duration::from_millis(1));
+                        // No new frame available - use last frame with a new timestamp if we have one
+                        if let Some(last_tex) = &last_texture {
+                            // Get a new QPC timestamp
+                            let present_time = match get_qpc_timestamp() {
+                                Ok(timestamp) => timestamp,
+                                Err(e) => {
+                                    eprintln!("Failed to get QPC timestamp for duplicate frame: {:?}", e);
+                                    thread::sleep(Duration::from_millis(1));
+                                    continue;
+                                }
+                            };
+                            
+                            // Create a duplicate frame with the new timestamp
+                            let frame = AcquiredFrame {
+                                texture: last_tex.clone(),
+                                frame_info: Default::default(), // Default frame info for duplicate
+                                present_time,
+                            };
+                            
+                            if frame_sender.send(Some(frame)).is_err() {
+                                println!("Failed to send duplicate frame, receiver disconnected");
+                                break 'outer;
+                            }
+                        } else {
+                            // No last texture yet, just wait a bit
+                            thread::sleep(Duration::from_millis(1));
+                        }
                     },
                     Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => {
                         println!("Access lost to output duplication, ending capture");
@@ -328,4 +369,18 @@ impl CaptureFrameGenerator {
         println!("Stopping capture");
         self.session.Close()
     }
+}
+
+fn get_qpc_timestamp() -> Result<TimeSpan> {
+    let mut qpc_timestamp: i64 = 0;
+    unsafe {
+        QueryPerformanceCounter(&mut qpc_timestamp)?;
+    }
+    
+    // Create a TimeSpan using the same pattern as your example
+    let timestamp = TimeSpan {
+        Duration: qpc_timestamp,
+    };
+    
+    Ok(timestamp)
 }
