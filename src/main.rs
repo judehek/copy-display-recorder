@@ -8,6 +8,7 @@ mod video;
 mod old_audio;
 mod window_detector;
 mod audio;
+mod encoding_session;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool};
@@ -16,11 +17,11 @@ use std::{path::Path, time::Duration};
 
 use args::Args;
 use audio::encoder_device::AudioEncoderDevice;
+use encoding_session::MediaEncodingSession;
 use old_audio::AudioSource;
 use clap::Parser;
 use d3d::set_multithread_protected;
 use hotkey::HotKey;
-use video::encoding_session::VideoEncodingSession;
 use windows::{
     core::{h, Result, RuntimeName, HSTRING},
     Foundation::Metadata::ApiInformation,
@@ -57,7 +58,8 @@ fn run(
     bit_rate: u32,
     frame_rate: u32,
     resolution: Resolution,
-    encoder_index: usize,
+    video_encoder_index: usize,
+    audio_encoder_index: usize,
     verbose: bool,
     wait_for_debugger: bool,
     console_mode: bool,
@@ -102,23 +104,41 @@ fn run(
         .get_size()
         .expect("Resolution must be specified when not using Graphics Capture.");
     let bit_rate = bit_rate * 1000000;
-    let encoder_devices = VideoEncoderDevice::enumerate()?;
-    if encoder_devices.is_empty() {
+    let video_encoder_devices = VideoEncoderDevice::enumerate()?;
+    if video_encoder_devices.is_empty() {
         exit_with_error("No hardware H264 encoders found!");
     }
     if verbose {
-        println!("Encoders ({}):", encoder_devices.len());
-        for encoder_device in &encoder_devices {
-            println!("  {}", encoder_device.display_name());
+        println!("Encoders ({}):", video_encoder_devices.len());
+        for video_encoder_device in &video_encoder_devices {
+            println!("  {}", video_encoder_device.display_name());
         }
     }
-    let encoder_device = if let Some(encoder_device) = encoder_devices.get(encoder_index) {
+    let video_encoder_device = if let Some(encoder_device) = video_encoder_devices.get(video_encoder_index) {
         encoder_device
     } else {
         exit_with_error("Encoder index is out of bounds!");
     };
     if verbose {
-        println!("Using: {}", encoder_device.display_name());
+        println!("Using: {}", video_encoder_device.display_name());
+    }
+    let audio_encoder_devices = AudioEncoderDevice::enumerate()?;
+    if audio_encoder_devices.is_empty() {
+        exit_with_error("No AAC encoders found!");
+    }
+    if verbose {
+        println!("Encoders ({}):", audio_encoder_devices.len());
+        for audio_encoder_device in &audio_encoder_devices {
+            println!("  {}", audio_encoder_device.display_name());
+        }
+    }
+    let audio_encoder_device = if let Some(audio_encoder_device) = audio_encoder_devices.get(audio_encoder_index) {
+        audio_encoder_device
+    } else {
+        exit_with_error("Encoder index is out of bounds!");
+    };
+    if verbose {
+        println!("Using: {}", audio_encoder_device.display_name());
     }
     
     // Create our file
@@ -152,7 +172,8 @@ fn run(
         let mut session = create_encoding_session(
             d3d_device,
             display_handle,
-            encoder_device,
+            video_encoder_device,
+            audio_encoder_device,
             resolution,
             bit_rate,
             frame_rate,
@@ -206,7 +227,8 @@ fn main() {
     let bit_rate: u32 = args.bit_rate;
     let frame_rate: u32 = args.frame_rate;
     let resolution: Resolution = args.resolution;
-    let encoder_index: usize = args.encoder;
+    let video_encoder_index: usize = args.video_encoder;
+    let audio_encoder_index: usize = args.audio_encoder;
 
     // Validate some of the params
     if !validate_path(output_path) {
@@ -219,7 +241,8 @@ fn main() {
         bit_rate,
         frame_rate,
         resolution,
-        encoder_index,
+        video_encoder_index,
+        audio_encoder_index,
         verbose | wait_for_debugger,
         wait_for_debugger,
         console_mode,
@@ -270,18 +293,21 @@ fn enum_encoders() -> Result<()> {
 fn create_encoding_session(
     d3d_device: ID3D11Device,
     monitor_handle: HMONITOR,
-    encoder_device: &VideoEncoderDevice,
+    video_encoder_device: &VideoEncoderDevice,
+    audio_encoder_device: &AudioEncoderDevice,
     resolution: SizeInt32,
     bit_rate: u32,
     frame_rate: u32,
     stream: IRandomAccessStream,
-) -> Result<VideoEncodingSession> {
-    let result = VideoEncodingSession::new(
+) -> Result<MediaEncodingSession> {
+    let result = MediaEncodingSession::new(
         d3d_device,
         monitor_handle,
-        encoder_device,
+        video_encoder_device,
+        audio_encoder_device,
         resolution,
         bit_rate,
+        80,
         frame_rate,
         stream,
     );

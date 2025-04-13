@@ -4,7 +4,7 @@ use windows::{
         Foundation::{CloseHandle, DECIMAL, HANDLE, S_OK},
         Media::MediaFoundation::{
             // Interfaces
-            IMFActivate, IMFCollection, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFAudioFormat_Float, MFAudioFormat_PCM, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Audio, MFShutdown, MFStartup, MFVideoInterlace_Progressive, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_CHANNEL_MASK, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION
+            IMFActivate, IMFCollection, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFAudioConstriction, MFAudioFormat_Float, MFAudioFormat_PCM, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Audio, MFShutdown, MFStartup, MFVideoInterlace_Progressive, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_CHANNEL_MASK, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION
             // MFPKEY_WMRESAMP_CHANNELMTX, // Add if custom matrix needed
             // MFPKEY_WMRESAMP_LOWPASS_BANDWIDTH, // Add if needed
         },
@@ -35,8 +35,8 @@ pub struct AudioFormat {
     pub sample_rate: u32,
     pub channels: u16,
     pub bits_per_sample: u16,
-    pub is_float: bool,
-    pub channel_mask: Option<u32>, // Optional: For WAVEFORMATEXTENSIBLE scenarios
+    pub channel_mask: Option<u32>,
+    pub format: GUID,
 }
 
 impl AudioFormat {
@@ -48,14 +48,6 @@ impl AudioFormat {
     fn avg_bytes_per_second(&self) -> u32 {
         self.sample_rate * self.block_align() as u32
     }
-
-    fn subtype_guid(&self) -> GUID {
-        if self.is_float {
-            MFAudioFormat_Float
-        } else {
-            MFAudioFormat_PCM
-        }
-    }
 }
 
 pub struct AudioProcessor {
@@ -64,9 +56,7 @@ pub struct AudioProcessor {
     output_media_type: IMFMediaType,
     input_stream_id: u32,
     output_stream_id: u32,
-    output_buffer_size: u32, // Estimated output buffer size from MFT
-    // Optional: Store the last output sample if needed outside process_sample
-    // last_output_sample: Option<IMFSample>,
+    output_buffer_size: u32,
 }
 
 impl AudioProcessor {
@@ -307,7 +297,7 @@ fn create_audio_media_type(format: &AudioFormat) -> Result<IMFMediaType> {
         let media_type = MFCreateMediaType()?;
 
         media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-        media_type.SetGUID(&MF_MT_SUBTYPE, &format.subtype_guid())?;
+        media_type.SetGUID(&MF_MT_SUBTYPE, &format.format)?;
         media_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, format.sample_rate)?;
         media_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, format.channels as u32)?;
         media_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, format.bits_per_sample as u32)?;

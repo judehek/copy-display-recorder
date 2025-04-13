@@ -22,8 +22,12 @@ pub struct Args {
     pub resolution: Resolution,
 
     /// The index of the encoder you'd like to use to record (use enum-encoders command for a list of encoders and their indices).
-    #[clap(short, long, default_value_t = 0)]
-    pub encoder: usize,
+    #[clap(long, default_value_t = 0)]
+    pub video_encoder: usize,
+
+    /// The index of the encoder you'd like to use to record (use enum-encoders command for a list of encoders and their indices).
+    #[clap(long, default_value_t = 0)]
+    pub audio_encoder: usize,
 
     /// Disables the yellow capture border (only available on Windows 11).
     #[clap(long)]

@@ -15,7 +15,7 @@ use windows::{
         Foundation::E_NOTIMPL,
         Media::MediaFoundation::{
             // Interfaces
-            IMFAttributes, IMFMediaBuffer, IMFMediaEventGenerator, IMFMediaType, IMFSample,
+            IMFAttributes, IMFMediaEventGenerator, IMFMediaType, IMFSample,
             IMFTransform,
             // Functions
             MFCreateMemoryBuffer, MFCreateMediaType, MFCreateSample, MFStartup,
@@ -23,17 +23,17 @@ use windows::{
             METransformHaveOutput, METransformNeedInput, MFMediaType_Audio,
             MFSTARTUP_FULL, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
             MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-            MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, // Needed for buffer hints
+            MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
             // Needed for ProcessOutput status
             MFT_SET_TYPE_TEST_ONLY, MF_EVENT_TYPE, MF_E_INVALIDMEDIATYPE,
-            MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_TYPE_NOT_SET,
+            MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_TYPE_NOT_SET,
             // MF_TRANSFORM_ASYNC_UNLOCK, // May still be useful
             MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
             // Audio Attributes (Add more as needed)
-            MFAudioFormat_AAC, MFAudioFormat_Float, MFAudioFormat_PCM,
+            MFAudioFormat_AAC, MFAudioFormat_PCM,
             MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE,
             MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS,
-            MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_USER_DATA,
+            MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
         },
         // System::Performance::{QueryPerformanceFrequency, QueryPerformanceCounter}, // Keep if needed for timing
     },
@@ -41,13 +41,13 @@ use windows::{
 
 use crate::video::encoder_device::VideoEncoderDevice;
 
-use super::processor::AudioFormat;
+use super::encoder_device::AudioEncoderDevice;
 
 // Represents one chunk of input audio data for the encoder
 // Contains the IMFSample holding an IMFMediaBuffer with PCM/Float data
 #[derive(Clone)]
 pub struct AudioEncoderInputSample {
-    sample: IMFSample, // Holds buffer + timestamp + duration
+    sample: IMFSample,
 }
 
 impl AudioEncoderInputSample {
@@ -103,68 +103,40 @@ impl AudioEncoderInputSample {
     }
 }
 
-// Represents one chunk of encoded output audio data (e.g., an AAC frame)
 pub struct AudioEncoderOutputSample {
-    sample: IMFSample, // Holds buffer + timestamp + duration
+    sample: IMFSample
 }
 
 impl AudioEncoderOutputSample {
     pub fn sample(&self) -> &IMFSample {
         &self.sample
     }
-    // Add helpers to get timestamp/duration if needed
-     pub fn timestamp(&self) -> Result<TimeSpan> {
-        let time = unsafe { self.sample.GetSampleTime()? };
-        Ok(TimeSpan { Duration: time })
-    }
-
-    pub fn duration(&self) -> Result<TimeSpan> {
-        let duration = unsafe { self.sample.GetSampleDuration()? };
-        Ok(TimeSpan { Duration: duration })
-    }
 }
 
-// Main struct managing the audio encoding process
 pub struct AudioEncoder {
     inner: Option<AudioEncoderInner>,
-    output_type: IMFMediaType, // Keep track of the configured output type
+    output_type: IMFMediaType,
     started: AtomicBool,
     should_stop: Arc<AtomicBool>,
     encoder_thread_handle: Option<JoinHandle<Result<()>>>,
 }
 
-// Holds the state needed by the encoding thread
 struct AudioEncoderInner {
-    transform: IMFTransform, // The actual encoder MFT (e.g., AAC encoder)
+    transform: IMFTransform,
     event_generator: IMFMediaEventGenerator,
     input_stream_id: u32,
     output_stream_id: u32,
 
-    output_buffer_size_hint: u32, // Store hint from GetOutputStreamInfo
-
-    // Callback to request the *next sequential* audio chunk (PCM/Float)
     sample_requested_callback:
         Option<Box<dyn Send + FnMut() -> Result<Option<AudioEncoderInputSample>>>>,
-    // Callback to deliver the encoded audio chunk (AAC)
     sample_rendered_callback: Option<Box<dyn Send + FnMut(AudioEncoderOutputSample) -> Result<()>>>,
 
     should_stop: Arc<AtomicBool>,
 }
 
 impl AudioEncoder {
-    /// Creates a new AudioEncoder.
-    ///
-    /// # Arguments
-    ///
-    /// * `encoder_transform` - The instantiated audio encoder MFT (e.g., AAC).
-    /// * `input_format` - The format of the raw audio data that will be fed *into* the encoder (e.g., PCM, Float).
-    /// * `output_sample_rate` - Desired output sample rate (AAC supports specific rates).
-    /// * `output_channels` - Desired output channels (e.g., 1 for mono, 2 for stereo).
-    /// * `output_bitrate` - Desired output bitrate in bits per second (e.g., 128000).
-    ///
     pub fn new(
-        encoder_device: VideoEncoderDevice, // Pass in the already created MFT
-        input_format: &AudioFormat,
+        encoder_device: &AudioEncoderDevice,
         output_sample_rate: u32,
         output_channels: u16,
         output_bitrate: u32,
@@ -180,28 +152,41 @@ impl AudioEncoder {
         unsafe {
             transform.GetStreamCount(&mut number_of_input_streams, &mut number_of_output_streams)?
         };
-        // Simple MFTs often have 1 input/1 output stream
-        if number_of_input_streams == 0 || number_of_output_streams == 0 {
-             return Err(Error::new(windows::Win32::Foundation::E_UNEXPECTED, "Encoder MFT reported zero streams".into()));
-        }
-    
-        let (input_stream_id, output_stream_id) = {
-             // Assume stream IDs are 0 unless GetStreamIDs succeeds and returns non-zero
-             let mut input_stream_ids = vec![0u32; number_of_input_streams as usize];
-             let mut output_stream_ids = vec![0u32; number_of_output_streams as usize];
-             match unsafe { transform.GetStreamIDs(&mut input_stream_ids, &mut output_stream_ids) } {
-                 Ok(_) => (input_stream_ids[0], output_stream_ids[0]),
-                 Err(e) if e.code() == E_NOTIMPL => {
-                     println!("Warning: GetStreamIDs returned E_NOTIMPL, assuming stream IDs are 0.");
-                     (0, 0) // Default to 0 for fixed-stream MFTs
-                 }
-                 Err(e) => return Err(e.into()), // Propagate other errors
-             }
+        let (input_stream_ids, output_stream_ids) = {
+            let mut input_stream_ids = vec![0u32; number_of_input_streams as usize];
+            let mut output_stream_ids = vec![0u32; number_of_output_streams as usize];
+            let result =
+                unsafe { transform.GetStreamIDs(&mut input_stream_ids, &mut output_stream_ids) };
+            match result {
+                Ok(_) => {}
+                Err(error) => {
+                    // https://docs.microsoft.com/en-us/windows/win32/api/mftransform/nf-mftransform-imftransform-getstreamids
+                    // This method can return E_NOTIMPL if both of the following conditions are true:
+                    //   * The transform has a fixed number of streams.
+                    //   * The streams are numbered consecutively from 0 to n – 1, where n is the
+                    //     number of input streams or output streams. In other words, the first
+                    //     input stream is 0, the second is 1, and so on; and the first output
+                    //     stream is 0, the second is 1, and so on.
+                    if error.code() == E_NOTIMPL {
+                        for i in 0..number_of_input_streams {
+                            input_stream_ids[i as usize] = i;
+                        }
+                        for i in 0..number_of_output_streams {
+                            output_stream_ids[i as usize] = i;
+                        }
+                    } else {
+                        return Err(error);
+                    }
+                }
+            }
+            (input_stream_ids, output_stream_ids)
         };
+        let input_stream_id = input_stream_ids[0];
+        let output_stream_id = output_stream_ids[0];
     
         // --- Set Output Media Type (AAC) directly --
-        let output_type = unsafe { MFCreateMediaType()? };
-        unsafe {
+        let output_type = unsafe {
+            let output_type = MFCreateMediaType()?;
             output_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
             output_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
             output_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, output_sample_rate)?;
@@ -211,86 +196,63 @@ impl AudioEncoder {
     
             // Try setting the output type
             transform.SetOutputType(output_stream_id, &output_type, 0)?; // No flags
-        }
+            output_type
+        };
     
         // --- Set Input Media Type (PCM/Float) directly --
-        unsafe {
-            // Create the input media type directly
-            let desired_input_type = MFCreateMediaType()?;
-            desired_input_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-            
-            // Determine Subtype
-            let subtype = if input_format.is_float {
-                MFAudioFormat_Float
-            } else {
-                MFAudioFormat_PCM
-            };
-            desired_input_type.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
-            
-            // Set audio format details
-            desired_input_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, input_format.sample_rate)?;
-            desired_input_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, input_format.channels as u32)?;
-            desired_input_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, input_format.bits_per_sample as u32)?;
-            
-            // Calculate block align and avg bytes per second
-            let block_align = input_format.channels as u32 * (input_format.bits_per_sample / 8) as u32;
-            let avg_bytes_per_sec = input_format.sample_rate * block_align;
-            
-            desired_input_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, block_align)?;
-            desired_input_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, avg_bytes_per_sec)?;
-    
-            // Find a compatible input type supported by the encoder
-            let mut i = 0;
-            let mut input_type_to_set: Option<IMFMediaType> = None;
+        let input_type: Option<IMFMediaType> = unsafe {
+            let mut count = 0;
             loop {
-                match transform.GetInputAvailableType(input_stream_id, i) {
-                    Ok(available_type) => {
-                        // Check if our desired type is compatible
-                        match transform.SetInputType(input_stream_id, &desired_input_type, MFT_SET_TYPE_TEST_ONLY.0 as u32) {
-                            Ok(_) => {
-                                // Found a compatible type (our desired type itself)
-                                input_type_to_set = Some(desired_input_type.clone());
-                                break;
-                            }
-                            Err(e) if e.code() == MF_E_INVALIDMEDIATYPE => {
-                                // Our desired type isn't directly supported in this exact form.
-                                i += 1;
-                            }
-                            Err(e) => return Err(e.into()), // Other error during test set
-                        }
-                        // Explicitly drop `available_type` COM ptr
-                        drop(available_type);
+                let result = transform.GetInputAvailableType(input_stream_id, count);
+                if let Err(error) = &result {
+                    if error.code() == MF_E_NO_MORE_TYPES {
+                        break None;
                     }
-                    Err(e) if e.code() == MF_E_NO_MORE_TYPES => {
-                        // Exhausted all available types, none matched.
-                        return Err(Error::new(MF_E_TRANSFORM_TYPE_NOT_SET,
-                            format!("Audio encoder does not support the provided input format: {:?}", input_format).into()));
-                    }
-                    Err(e) => return Err(e.into()), // Error getting available type
                 }
+
+                let input_type = result?;
+                let attributes: IMFAttributes = input_type.cast()?;
+                input_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+                input_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+                input_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000)?;
+                input_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2 as u32)?;
+                input_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 32 as u32)?;
+                input_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4)?;
+                input_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192000)?;
+                let result = transform.SetInputType(
+                    input_stream_id,
+                    &input_type,
+                    MFT_SET_TYPE_TEST_ONLY.0 as u32,
+                );
+                if let Err(error) = &result {
+                    if error.code() == MF_E_INVALIDMEDIATYPE {
+                        count += 1;
+                        continue;
+                    }
+                }
+                result?;
+                break Some(input_type);
             }
-    
-            // Actually set the validated input type
-            transform.SetInputType(input_stream_id, &input_type_to_set.unwrap(), 0)?; // No flags
+        };
+        if let Some(input_type) = input_type {
+            unsafe { transform.SetInputType(input_stream_id, &input_type, 0)? };
+        } else {
+            return Err(Error::new(
+                MF_E_TRANSFORM_TYPE_NOT_SET,
+                "No suitable input type found! Try a different set of encoding settings.".into(),
+            ));
         }
-    
-        // Get output stream info *after* types are set
-        let stream_info = unsafe { transform.GetOutputStreamInfo(output_stream_id)? };
-        // cbSize gives a hint for buffer allocation. AAC frames are variable size,
-        // but this provides a reasonable upper bound or typical size.
-        let output_buffer_size_hint = if stream_info.cbSize > 0 { stream_info.cbSize } else { 4096 }; // Default fallback
     
         let should_stop = Arc::new(AtomicBool::new(false));
         let inner = AudioEncoderInner {
-            transform, // Move transform ownership
+            transform,
             event_generator,
             input_stream_id,
             output_stream_id,
-            output_buffer_size_hint,
     
-            sample_requested_callback: None, // To be set later
-            sample_rendered_callback: None,  // To be set later
-    
+            sample_requested_callback: None,
+            sample_rendered_callback: None,
+
             should_stop: should_stop.clone(),
         };
     

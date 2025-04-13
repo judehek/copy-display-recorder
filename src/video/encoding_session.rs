@@ -23,7 +23,7 @@ use windows::{
     },
 };
 
-use crate::video::capture::{AcquiredFrame, CaptureFrameGenerator, CustomGraphicsCaptureSession};
+use crate::{encoding_session::SampleWriter, video::capture::{AcquiredFrame, CaptureFrameGenerator, CustomGraphicsCaptureSession}};
 
 use super::{
     encoder::{VideoEncoder, VideoEncoderInputSample},
@@ -34,7 +34,6 @@ use super::{
 pub struct VideoEncodingSession {
     video_encoder: VideoEncoder,
     capture_session: CustomGraphicsCaptureSession,
-    sample_writer: Arc<SampleWriter>,
 }
 
 struct SampleGenerator {
@@ -54,12 +53,6 @@ struct SampleGenerator {
     next_frame_time: TimeSpan,
 }
 
-pub struct SampleWriter {
-    _stream: IRandomAccessStream,
-    sink_writer: IMFSinkWriter,
-    sink_writer_stream_index: u32,
-}
-
 impl VideoEncodingSession {
     pub fn new(
         d3d_device: ID3D11Device,
@@ -68,7 +61,7 @@ impl VideoEncodingSession {
         resolution: SizeInt32,
         bit_rate: u32,
         frame_rate: u32,
-        stream: IRandomAccessStream,
+        sample_writer: Arc<SampleWriter>,
     ) -> Result<Self> {
         let input_size = ensure_even_size(resolution);
         let output_size = ensure_even_size(resolution);
@@ -81,7 +74,6 @@ impl VideoEncodingSession {
             bit_rate,
             frame_rate,
         )?;
-        let output_type = video_encoder.output_type().clone();
 
         let mut sample_generator = SampleGenerator::new(
             d3d_device, 
@@ -95,21 +87,18 @@ impl VideoEncodingSession {
             move || -> Result<Option<VideoEncoderInputSample>> { sample_generator.generate() },
         );
 
-        let sample_writer = Arc::new(SampleWriter::new(stream, &output_type)?);
         video_encoder.set_sample_rendered_callback({
             let sample_writer = sample_writer.clone();
-            move |sample| -> Result<()> { sample_writer.write(sample.sample()) }
+            move |sample| -> Result<()> { sample_writer.write_video_sample(sample.sample()) }
         });
 
         Ok(Self {
             video_encoder,
             capture_session,
-            sample_writer,
         })
     }
 
     pub fn start(&mut self) -> Result<()> {
-        self.sample_writer.start()?;
         self.capture_session.StartCapture()?;
         assert!(self.video_encoder.try_start()?);
         Ok(())
@@ -117,7 +106,6 @@ impl VideoEncodingSession {
 
     pub fn stop(&mut self) -> Result<()> {
         self.video_encoder.stop()?;
-        self.sample_writer.stop()?;
         Ok(())
     }
 }
@@ -310,60 +298,6 @@ impl SampleGenerator {
         }
     }
 }
-
-unsafe impl Send for SampleWriter {}
-unsafe impl Sync for SampleWriter {}
-impl SampleWriter {
-    pub fn new(
-        stream: IRandomAccessStream,
-        output_type: &IMFMediaType,
-    ) -> Result<Self> {
-        let empty_attributes = unsafe {
-            let mut attributes = None;
-            MFCreateAttributes(&mut attributes, 0)?;
-            attributes.unwrap()
-        };
-        let sink_writer = unsafe {
-            let byte_stream = MFCreateMFByteStreamOnStreamEx(&stream)?;
-            MFCreateSinkWriterFromURL(&HSTRING::from(".mp4"), &byte_stream, &empty_attributes)?
-        };
-        let sink_writer_stream_index = unsafe { sink_writer.AddStream(output_type)? };
-        unsafe {
-            sink_writer.SetInputMediaType(
-                sink_writer_stream_index,
-                output_type,
-                &empty_attributes,
-            )?
-        };
-
-        Ok(Self {
-            _stream: stream,
-            sink_writer,
-            sink_writer_stream_index,
-        })
-    }
-
-    pub fn start(&self) -> Result<()> {
-        unsafe { self.sink_writer.BeginWriting() }
-    }
-
-    pub fn stop(&self) -> Result<()> {
-        unsafe { self.sink_writer.Finalize() }
-    }
-
-    pub fn write(&self, sample: &IMFSample) -> Result<()> {
-        // Get the sample time directly
-        unsafe {
-            //let time = sample.GetSampleTime()?;
-            //println!("Sample time: {}", time);
-            
-            // Write the sample to the sink
-            self.sink_writer
-                .WriteSample(self.sink_writer_stream_index, sample)
-        }
-    }
-}
-
 
 const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 

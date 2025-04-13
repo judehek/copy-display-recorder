@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
 use windows::{
-    core::{Result, HSTRING},
+    core::{imp::CoTaskMemFree, ComInterface, Result, HSTRING},
     Foundation::TimeSpan,
     Graphics::SizeInt32,
     Storage::Streams::IRandomAccessStream,
@@ -15,26 +15,29 @@ use windows::{
             Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC},
             Gdi::HMONITOR,
         },
-        Media::MediaFoundation::{
-            IMFMediaType, IMFSample, IMFSinkWriter, MFCreateAttributes, 
-            MFCreateMFByteStreamOnStreamEx, MFCreateSinkWriterFromURL
-        },
-        System::Performance::QueryPerformanceFrequency
+        Media::{Audio::{IAudioClient, IMMDevice}, MediaFoundation::{
+            IMFMediaType, IMFSample, IMFSinkWriter, MFAudioFormat_PCM, MFCreateAttributes, MFCreateMFByteStreamOnStreamEx, MFCreateSinkWriterFromURL
+        }},
+        System::{Com::CLSCTX_ALL, Performance::QueryPerformanceFrequency}
     },
 };
 
-use crate::audio::capture::{AcquiredFrame, CaptureAudioGenerator};
+use crate::{audio::capture_audio::{CaptureAudioGenerator}, encoding_session::SampleWriter};
 
 use super::{
-    encoder::{AudioEncoder, AudioEncoderInputSample},
-    encoder_device::{AudioEncoderDevice, VideoEncoderDevice},
-    processor::{AudioFormat, AudioProcessor, VideoProcessor},
+    capture_audio::AudioCaptureSession, capture_microphone::{CaptureMicrophoneGenerator, MicrophoneCaptureSession}, encoder::{AudioEncoder, AudioEncoderInputSample}, encoder_device::{AudioEncoderDevice}, processor::{AudioFormat, AudioProcessor}
 };
 
+#[derive(Clone)]
+pub enum AudioSource {
+    Desktop,
+    ActiveWindow,
+}
+
 pub struct AudioEncodingSession {
-    video_encoder: AudioEncoder,
-    capture_session: CustomGraphicsCaptureSession,
-    sample_writer: Arc<SampleWriter>,
+    audio_encoder: AudioEncoder,
+    audio_capture_session: Option<AudioCaptureSession>,
+    microphone_capture_session: Option<MicrophoneCaptureSession>,
 }
 
 struct SampleGenerator {
@@ -42,67 +45,77 @@ struct SampleGenerator {
     microphone_processor: Option<AudioProcessor>,
 
     audio_generator: Option<CaptureAudioGenerator>,
-    microphone_generator: Option<CaptureAudioGenerator>,
-}
+    microphone_generator: Option<CaptureMicrophoneGenerator>,
 
-pub struct SampleWriter {
-    _stream: IRandomAccessStream,
-    sink_writer: IMFSinkWriter,
-    sink_writer_stream_index: u32,
+    seen_first_time_stamp: bool,
+    first_timestamp: i64,
+
+    frame_period: i64,
+    next_frame_time: TimeSpan,
+    total_samples_processed: i64,
 }
 
 impl AudioEncodingSession {
     pub fn new(
         encoder_device: &AudioEncoderDevice,
         bit_rate: u32,
-        frame_rate: u32,
-        stream: IRandomAccessStream,
+        sample_writer: Arc<SampleWriter>,
     ) -> Result<Self> {
         let mut audio_encoder = AudioEncoder::new(
-            encoder_device,
-            d3d_device.clone(),
-            output_size,
-            output_size,
-            bit_rate,
-            frame_rate,
+            &encoder_device,
+48000,
+            2,
+            8,
         )?;
-        let output_type = audio_encoder.output_type().clone();
+
+        let output_format = AudioFormat {
+            sample_rate: 48000,    // 48kHz is standard for professional audio
+            channels: 2,           // Stereo output
+            bits_per_sample: 32,   // 16-bit PCM is widely compatible
+            channel_mask: Some(3), // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT (0x1 | 0x2)
+            format: MFAudioFormat_PCM, // PCM format for compatibility
+        };
 
         let mut sample_generator = SampleGenerator::new(
-            d3d_device, 
-            monitor_handle,
-            input_size, 
-            output_size,
-            frame_rate,
+            true,
+            AudioSource::Desktop,
+            false, 
+            None,
+            output_format,
+            None,
         )?;
-        let capture_session = sample_generator.capture_session().clone();
+        println!("created sample gen");
+        let audio_capture_session = sample_generator.audio_capture_session().clone();
+        let microphone_capture_session = sample_generator.microphone_capture_session().clone();
         audio_encoder.set_sample_requested_callback(
             move || -> Result<Option<AudioEncoderInputSample>> { sample_generator.generate() },
         );
 
-        let sample_writer = Arc::new(SampleWriter::new(stream, &output_type)?);
         audio_encoder.set_sample_rendered_callback({
             let sample_writer = sample_writer.clone();
-            move |sample| -> Result<()> { sample_writer.write(sample.sample()) }
+            move |sample| -> Result<()> { sample_writer.write_audio_sample(sample.sample()) }
         });
 
         Ok(Self {
             audio_encoder,
-            capture_session,
-            sample_writer,
+            audio_capture_session,
+            microphone_capture_session
         })
     }
 
     pub fn start(&mut self) -> Result<()> {
-        self.sample_writer.start()?;
-        self.capture_session.StartCapture()?;
-        assert!(self.video_encoder.try_start()?);
+        if let Some(session) = &mut self.audio_capture_session {
+            session.StartCapture()?;
+        }
+        if let Some(session) = &mut self.microphone_capture_session {
+           session.StartCapture()?;
+       }
+        assert!(self.audio_encoder.try_start()?);
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<()> {
-        self.video_encoder.stop()?;
-        self.sample_writer.stop()?;
+        self.audio_encoder.stop()?;
         Ok(())
     }
 }
@@ -111,210 +124,318 @@ unsafe impl Send for SampleGenerator {}
 impl SampleGenerator {
     pub fn new(
         capture_audio: bool,
+        audio_source: AudioSource,
         capture_microphone: bool,
-        audio_input_format: AudioFormat,
-        microphone_input_format: AudioFormat,
+        microphone_device: Option<IMMDevice>,
         output_format: AudioFormat,
         quality: Option<u32>,
     ) -> Result<Self> {
+        // Initialize variables to be used in conditionals
+        let mut audio_generator = None;
+        let mut audio_processor = None;
+        let mut microphone_generator = None;
+        let mut microphone_processor = None;
+
         if capture_audio {
-            let audio_processor = AudioProcessor::new(
+            // Create the audio generator
+            let mut temp_audio_generator = CaptureAudioGenerator::new(audio_source)?;
+            println!("created capture audio gen");
+            // Start capture and wait for initialization with 500ms timeout
+            temp_audio_generator.start_capture_and_wait(500)?;
+            
+            // Create the audio processor with the audio format from the generator
+            let audio_input_format = AudioFormat {
+                sample_rate: temp_audio_generator.get_sample_rate(),
+                channels: temp_audio_generator.get_channels(),
+                bits_per_sample: temp_audio_generator.get_bits_per_sample(),
+                channel_mask: None,
+                format: MFAudioFormat_PCM,
+            };
+            
+            audio_generator = Some(temp_audio_generator);
+            audio_processor = Some(AudioProcessor::new(
                 audio_input_format,
-                output_format,
+                output_format.clone(),
                 quality,
-            )?;
+            )?);
         }
 
-        if capture_microphone {
-            let microphone_processor = AudioProcessor::new(
-                audio_input_format,
-                output_format,
-                quality,
-            )?;
-        }
-
-        // Create frame generator
-        let audio_generator = CaptureAudioGenerator::new(d3d_device.clone(), monitor_handle)?;
+        /*if capture_microphone {
+            if let Some(device) = &microphone_device {
+                // Create the microphone generator
+                let mut temp_microphone_generator = CaptureMicrophoneGenerator::new(device.clone())?;
+                
+                // Start capture and wait for initialization with 500ms timeout
+                temp_microphone_generator.start_capture_and_wait(500)?;
+                
+                // Create the audio processor with the microphone format from the generator
+                let microphone_input_format = AudioFormat {
+                    sample_rate: temp_microphone_generator.get_sample_rate(),
+                    channels: temp_microphone_generator.get_channels(),
+                    bits_per_sample: temp_microphone_generator.get_bits_per_sample(),
+                };
+                
+                microphone_generator = Some(temp_microphone_generator);
+                microphone_processor = Some(AudioProcessor::new(
+                    microphone_input_format,
+                    output_format.clone(),
+                    quality,
+                )?);
+            }
+        }*/
 
         Ok(Self {
-            d3d_device,
-            d3d_context,
-
-            video_processor,
-            compose_texture,
-            render_target_view,
-
             audio_generator,
+            audio_processor,
+            microphone_generator,
+            microphone_processor,
+
+            seen_first_time_stamp: false,
+            first_timestamp: 0,
+        
+            frame_period: 0,
+            next_frame_time: TimeSpan::default(),
+            total_samples_processed: 0,
         })
     }
 
-    pub fn capture_session(&self) -> &CustomGraphicsCaptureSession {
-        self.audio_generator.session()
+    pub fn audio_capture_session(&self) -> Option<AudioCaptureSession> {
+        self.audio_generator.as_ref().map(|gen| gen.session().clone())
+    }
+
+    pub fn microphone_capture_session(&self) -> Option<MicrophoneCaptureSession> {
+        self.microphone_generator.as_ref().map(|gen| gen.session().clone())
     }
 
     pub fn generate(&mut self) -> Result<Option<AudioEncoderInputSample>> {
-        while let Some(frame) = self.frame_generator.try_get_next_frame()? {
-            // Initialize timing on first frame
-            if !self.seen_first_time_stamp {
-                self.first_timestamp = frame.present_time;
-                self.seen_first_time_stamp = true;
-                self.next_frame_time = TimeSpan {
-                    Duration: self.first_timestamp.Duration + self.frame_period,
-                };
-                
-                return self.generate_from_frame(&frame).map(Some);
+        // Define buffer size based on your requirements
+        let max_samples = 1024; // Adjust based on your needs
+        let mut audio_buffer = vec![0.0f32; max_samples];
+        let mut mic_buffer = vec![0.0f32; max_samples];
+        
+        // 1. Try get both audio sources
+        let mut audio_samples = 0;
+        let mut mic_samples = 0;
+        
+        // Get audio samples if available
+        if let Some(generator) = &mut self.audio_generator {
+            if let Some(count) = generator.try_get_audio_samples(&mut audio_buffer, max_samples) {
+                audio_samples = count;
             }
-            
-            // Calculate timing relative to first frame
-            let relative_time = frame.present_time.Duration - self.first_timestamp.Duration;
-            let expected_time = self.next_frame_time.Duration - self.first_timestamp.Duration;
-            
-            // Check if this frame meets our timing requirements
-            if relative_time >= expected_time {
-
-                // Update next expected frame time
-                self.next_frame_time.Duration += self.frame_period;
-                
-                return self.generate_from_frame(&frame).map(Some);
-            }
-            
-            // Frame is too early, skip it and continue loop
         }
         
-        // No more frames, end capture
-        self.stop_capture()?;
+        // Get microphone samples if available
+        if let Some(generator) = &mut self.microphone_generator {
+            if let Some(count) = generator.try_get_audio_samples(&mut mic_buffer, max_samples) {
+                mic_samples = count;
+            }
+        }
+        
+        // If no samples available from either source, end capture
+        if audio_samples == 0 && mic_samples == 0 {
+            self.stop_capture()?;
+            return Ok(None);
+        }
+        
+        // Calculate current timestamp and duration based on sample position and rate
+        let sample_rate = self.audio_generator
+            .as_ref()
+            .map(|g| g.get_sample_rate())
+            .unwrap_or(48000) as f64;
+            
+        let current_time = if !self.seen_first_time_stamp {
+            // Initialize timing on first batch of samples
+            self.first_timestamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64;
+            self.seen_first_time_stamp = true;
+            
+            TimeSpan { Duration: 0 }
+        } else {
+            // For subsequent samples, calculate relative time based on sample position
+            let time_in_seconds = self.total_samples_processed as f64 / sample_rate;
+            let duration_100ns = (time_in_seconds * 10_000_000.0) as i64;
+            
+            TimeSpan { Duration: duration_100ns }
+        };
+        
+        // Calculate duration for this batch of samples (critical for AAC encoding)
+        let samples_this_batch = audio_samples.max(mic_samples) as f64;
+        let duration_in_seconds = samples_this_batch / sample_rate;
+        let duration_100ns = (duration_in_seconds * 10_000_000.0) as i64;
+        let duration = TimeSpan { Duration: duration_100ns };
+        
+        // Convert float samples to bytes for IMFSample creation - moved out of nested blocks
+        // to avoid borrowing conflicts
+        let audio_bytes = if audio_samples > 0 {
+            self.float_to_bytes(&audio_buffer[0..audio_samples])
+        } else {
+            Vec::new()
+        };
+        
+        let mic_bytes = if mic_samples > 0 {
+            self.float_to_bytes(&mic_buffer[0..mic_samples])
+        } else {
+            Vec::new()
+        };
+        
+        // 2. Process both audio sources
+        let processed_audio = if audio_samples > 0 {
+            if let Some(processor) = &mut self.audio_processor {
+                // Create an IMFSample through from_raw
+                let audio_sample = AudioEncoderInputSample::from_raw(
+                    &audio_bytes,
+                    current_time,
+                    duration
+                )?;
+                
+                // Process the sample and extract resulting IMFSample
+                let processed_sample = processor.process_sample(&audio_sample.sample())?;
+                
+                processed_sample
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        let processed_mic = if mic_samples > 0 {
+            if let Some(processor) = &mut self.microphone_processor {
+                // Create an IMFSample through from_raw
+                let mic_sample = AudioEncoderInputSample::from_raw(
+                    &mic_bytes,
+                    current_time,
+                    duration
+                )?;
+                
+                // Process the sample and extract resulting IMFSample
+                let processed_sample = processor.process_sample(&mic_sample.sample())?;
+                
+                processed_sample
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        // Track total samples processed for timing
+        self.total_samples_processed += audio_samples.max(mic_samples) as i64;
+        
+        // 3. Mix if needed
+        if processed_audio.is_some() && processed_mic.is_some() {
+            // Both sources available, mix them
+            return Ok(Some(self.mix_audio_samples(
+                processed_audio.unwrap(),
+                processed_mic.unwrap(),
+                current_time,
+                duration
+            )?));
+        } else if let Some(audio) = processed_audio {
+            // Only system audio available
+            return Ok(Some(AudioEncoderInputSample::new(audio)));
+        } else if let Some(mic) = processed_mic {
+            // Only microphone audio available
+            return Ok(Some(AudioEncoderInputSample::new(mic)));
+        }
+        
+        // Should never reach here given the earlier check
         Ok(None)
     }
-
+    
     fn stop_capture(&mut self) -> Result<()> {
-        self.frame_generator.stop_capture()
+        // Stop audio capture if it exists
+        if let Some(generator) = &mut self.audio_generator {
+            generator.stop_capture()?;
+        }
+        
+        // Stop microphone capture if it exists
+        if let Some(generator) = &mut self.microphone_generator {
+            generator.stop_capture()?;
+        }
+        
+        Ok(())
     }
     
-    fn generate_from_frame(
+    // Helper to convert float samples to bytes
+    fn float_to_bytes(&self, samples: &[f32]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(samples.len() * 4);
+        for sample in samples {
+            let sample_bytes = sample.to_le_bytes();
+            bytes.extend_from_slice(&sample_bytes);
+        }
+        bytes
+    }
+    
+    fn mix_audio_samples(
         &mut self,
-        frame: &AcquiredFrame,
-    ) -> Result<VideoEncoderInputSample> {
-        let frame_texture = &frame.texture;
-        let frame_time = frame.present_time;
-
-        if !self.seen_first_time_stamp {
-            self.first_timestamp = frame_time;
-            self.seen_first_time_stamp = true;
+        audio_sample: IMFSample,
+        mic_sample: IMFSample,
+        timestamp: TimeSpan,
+        duration: TimeSpan
+    ) -> Result<AudioEncoderInputSample> {
+        // Extract audio data from both samples
+        let (audio_data, audio_len) = self.extract_float_data_from_sample(&audio_sample)?;
+        let (mic_data, mic_len) = self.extract_float_data_from_sample(&mic_sample)?;
+        
+        // Create a new buffer for the mixed audio
+        let mix_len = audio_len.min(mic_len);
+        let mut mixed_data = vec![0.0f32; mix_len];
+        
+        // Apply mixing with level control
+        let audio_level = 0.7;
+        let mic_level = 0.3;
+        
+        // Mix the data
+        for i in 0..mix_len {
+            mixed_data[i] = audio_data[i] * audio_level + mic_data[i] * mic_level;
         }
-
-        let timestamp = TimeSpan {
-            Duration: frame_time.Duration - self.first_timestamp.Duration,
-        };
+        
+        // Convert mixed float data to bytes
+        let mixed_bytes = self.float_to_bytes(&mixed_data);
+        
+        // Create the final sample using from_raw
+        AudioEncoderInputSample::from_raw(
+            &mixed_bytes,
+            timestamp,
+            duration
+        )
+    }
     
-        // Determine region to copy
-        let desc = unsafe {
-            let mut desc = D3D11_TEXTURE2D_DESC::default();
-            frame_texture.GetDesc(&mut desc);
-            desc
-        };
-        let region = D3D11_BOX {
-            left: 0, right: desc.Width, top: 0, bottom: desc.Height, back: 1, front: 0,
-        };
-    
-        // GPU Processing
+    // Helper to extract float data from an IMFSample
+    fn extract_float_data_from_sample(&self, sample: &IMFSample) -> Result<(Vec<f32>, usize)> {
         unsafe {
-            // Clear render target
-            self.d3d_context.ClearRenderTargetView(&self.render_target_view, &CLEAR_COLOR);
-    
-            // Copy the captured frame to composition texture
-            self.d3d_context.CopySubresourceRegion(
-                &self.compose_texture,
-                0, 0, 0, 0,
-                frame_texture,
-                0, Some(&region),
+            // Get the first buffer
+            let buffer = sample.GetBufferByIndex(0)?;
+            
+            // Lock the buffer to read data
+            let mut data_ptr = std::ptr::null_mut();
+            let mut max_length = 0;
+            let mut current_length = 0;
+            buffer.Lock(&mut data_ptr, Some(&mut max_length), Some(&mut current_length))?;
+            
+            // Calculate how many float samples we have
+            let sample_count = current_length as usize / std::mem::size_of::<f32>();
+            
+            // Create a vector to hold the samples
+            let mut samples = vec![0.0f32; sample_count];
+            
+            // Copy the data
+            std::ptr::copy_nonoverlapping(
+                data_ptr as *const f32,
+                samples.as_mut_ptr(),
+                sample_count
             );
-    
-            // Process BGRA -> NV12
-            // Fix: Call the function directly and use ? afterward
-            self.video_processor.process_texture(&self.compose_texture)?;
-    
-            // Get the resulting NV12 texture
-            let video_output_texture = self.video_processor.output_texture();
-    
-            // Create a new texture for the sample
-            let sample_texture = {
-                 let output_desc = {
-                     let mut desc = D3D11_TEXTURE2D_DESC::default();
-                     video_output_texture.GetDesc(&mut desc);
-                     desc
-                 };
-                 
-                 // Fix: Call the function directly and use ? afterward
-                 let mut texture = None;
-                 self.d3d_device.CreateTexture2D(&output_desc, None, Some(&mut texture))?;
-                 texture.unwrap()
-            };
             
-            // Copy the processed texture to the sample texture
-            self.d3d_context.CopyResource(&sample_texture, video_output_texture);
-    
-            // Create and return the input sample
-            Ok(VideoEncoderInputSample::new(
-                timestamp,
-                sample_texture,
-            ))
+            // Unlock the buffer
+            buffer.Unlock()?;
+            
+            Ok((samples, sample_count))
         }
     }
 }
-
-unsafe impl Send for SampleWriter {}
-unsafe impl Sync for SampleWriter {}
-impl SampleWriter {
-    pub fn new(
-        stream: IRandomAccessStream,
-        output_type: &IMFMediaType,
-    ) -> Result<Self> {
-        let empty_attributes = unsafe {
-            let mut attributes = None;
-            MFCreateAttributes(&mut attributes, 0)?;
-            attributes.unwrap()
-        };
-        let sink_writer = unsafe {
-            let byte_stream = MFCreateMFByteStreamOnStreamEx(&stream)?;
-            MFCreateSinkWriterFromURL(&HSTRING::from(".mp4"), &byte_stream, &empty_attributes)?
-        };
-        let sink_writer_stream_index = unsafe { sink_writer.AddStream(output_type)? };
-        unsafe {
-            sink_writer.SetInputMediaType(
-                sink_writer_stream_index,
-                output_type,
-                &empty_attributes,
-            )?
-        };
-
-        Ok(Self {
-            _stream: stream,
-            sink_writer,
-            sink_writer_stream_index,
-        })
-    }
-
-    pub fn start(&self) -> Result<()> {
-        unsafe { self.sink_writer.BeginWriting() }
-    }
-
-    pub fn stop(&self) -> Result<()> {
-        unsafe { self.sink_writer.Finalize() }
-    }
-
-    pub fn write(&self, sample: &IMFSample) -> Result<()> {
-        // Get the sample time directly
-        unsafe {
-            //let time = sample.GetSampleTime()?;
-            //println!("Sample time: {}", time);
-            
-            // Write the sample to the sink
-            self.sink_writer
-                .WriteSample(self.sink_writer_stream_index, sample)
-        }
-    }
-}
-
 
 const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 

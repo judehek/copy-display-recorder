@@ -61,6 +61,7 @@ pub fn start_window_change_detector(is_recording_window: Arc<AtomicBool>) -> HWI
     }
 
     // Set up the event hook
+    // TODO: make sure this isnt a resource leak, too lazy to check rn
     unsafe {
         SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,
