@@ -3,7 +3,11 @@ use std::thread;
 
 use ringbuf::traits::{Consumer, Observer};
 use ringbuf::wrap::caching::Caching;
+use windows::Foundation::TimeSpan;
 use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
+use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+use windows::Win32::System::Performance::QueryPerformanceFrequency;
 use windows::{
     core::*,
     Win32::{
@@ -11,7 +15,7 @@ use windows::{
         Media::Audio::{
             eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator, 
             AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-            WAVEFORMATEX
+            WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
         },
         System::{
             Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED},
@@ -26,11 +30,21 @@ use std::sync::atomic::{AtomicU32, AtomicU16, AtomicBool, Ordering};
 
 use super::encoding_session::AudioSource;
 
-// Constant used within this module
+// Constants used within this module
+const REFTIMES_PER_SEC: i64 = 10000000; // 100ns units per second
 const REFTIMES_PER_MILLISEC: i64 = 10000; // 100ns units per millisecond
-const DEFAULT_SAMPLE_RATE: u32 = 48000;
-const DEFAULT_CHANNELS: u16 = 2;
-const DEFAULT_BITS_PER_SAMPLE: u16 = 32;  // Default to 32-bit float
+
+// Hard-coded audio format constants
+const HARD_CODED_SAMPLE_RATE: u32 = 48000;
+const HARD_CODED_CHANNELS: u16 = 2;
+const HARD_CODED_BITS_PER_SAMPLE: u16 = 32;  // 32-bit float
+
+pub struct AudioSample {
+    pub data: Vec<u8>,
+    pub timestamp: TimeSpan,
+    pub duration: TimeSpan,
+    pub frames: u32,
+}
 
 pub struct AudioCaptureSession {
     sender: Sender<bool>, // To signal start/stop
@@ -53,7 +67,7 @@ impl AudioCaptureSession {
         Ok(())
     }
 
-    pub fn Close(&mut self) -> Result<()> {
+    pub fn StopCapture(&mut self) -> Result<()> {
         if self.running {
             self.sender.send(false).map_err(|_| windows::core::Error::from(E_FAIL))?;
             self.running = false;
@@ -72,13 +86,38 @@ impl Clone for AudioCaptureSession {
 }
 
 pub struct CaptureAudioGenerator {
-    consumer: Caching<Arc<ringbuf::SharedRb<ringbuf::storage::Heap<f32>>>, false, true>,
+    consumer: Caching<Arc<ringbuf::SharedRb<ringbuf::storage::Heap<AudioSample>>>, false, true>,
     session: AudioCaptureSession,
     sample_rate: Arc<AtomicU32>,
     channels: Arc<AtomicU16>,
     bits_per_sample: Arc<AtomicU16>,
     initialized: Arc<AtomicBool>,
-    sample_position: u64,
+    start_qpc: i64,
+    qpf_frequency: i64,
+}
+
+// Helper function to create a WAVEFORMATEXTENSIBLE struct with our hard-coded format
+unsafe fn create_hardcoded_wave_format() -> WAVEFORMATEXTENSIBLE {
+    let bytes_per_sample = (HARD_CODED_BITS_PER_SAMPLE / 8) as u16;
+    let block_align = HARD_CODED_CHANNELS * bytes_per_sample;
+    let avg_bytes_per_sec = HARD_CODED_SAMPLE_RATE * block_align as u32;
+    
+    let mut format = WAVEFORMATEXTENSIBLE::default();
+    format.Format.wFormatTag = WAVE_FORMAT_EXTENSIBLE as u16;
+    format.Format.nChannels = HARD_CODED_CHANNELS;
+    format.Format.nSamplesPerSec = HARD_CODED_SAMPLE_RATE;
+    format.Format.nAvgBytesPerSec = avg_bytes_per_sec;
+    format.Format.nBlockAlign = block_align;
+    format.Format.wBitsPerSample = HARD_CODED_BITS_PER_SAMPLE;
+    format.Format.cbSize = 22; // Size of the WAVEFORMATEXTENSIBLE struct minus the size of WAVEFORMATEX
+    
+    format.Samples.wValidBitsPerSample = HARD_CODED_BITS_PER_SAMPLE;
+    format.dwChannelMask = 3; // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
+    
+    // Set the SubFormat to IEEE_FLOAT
+    format.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    
+    format
 }
 
 unsafe fn initialize_audio_capture(audio_source: &AudioSource) -> Result<(IAudioClient, IAudioCaptureClient, HANDLE, u32, u16, u16)> {
@@ -91,18 +130,9 @@ unsafe fn initialize_audio_capture(audio_source: &AudioSource) -> Result<(IAudio
     // Activate audio client
     let client: IAudioClient = device.Activate(CLSCTX_ALL, None)?;
     
-    // Get mix format
-    let wave_format_ptr = client.GetMixFormat()?;
-    
-    // Extract format information before we free the pointer
-    let sample_rate = (*wave_format_ptr).nSamplesPerSec;
-    let channels = (*wave_format_ptr).nChannels;
-    let bits_per_sample = (*wave_format_ptr).wBitsPerSample;
-    
     // Create event handle
     let handle = CreateEventW(None, false, false, None)?;
     if handle.is_invalid() {
-        CoTaskMemFree(Some(wave_format_ptr as *const _));
         return Err(windows::core::Error::from(E_FAIL));
     }
     
@@ -114,20 +144,17 @@ unsafe fn initialize_audio_capture(audio_source: &AudioSource) -> Result<(IAudio
             stream_flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
         },
         AudioSource::ActiveWindow => {
-            // TODO: For future implementation, we would:
-            // 1. Get the active window handle using GetForegroundWindow()
-            // 2. Get the process ID of that window using GetWindowThreadProcessId()
-            // 3. Set up an IAudioSessionManager2 and enumerate audio sessions
-            // 4. Find the session matching our process ID
-            // 5. Capture audio from that specific session
-            
-            // For now, just use loopback as a fallback
+            // TODO: For future implementation - for now, use loopback
             stream_flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
             println!("Warning: Active window audio capture not fully implemented yet, falling back to desktop audio");
         }
     }
     
-    // Initialize audio client
+    // Create our hard-coded WAVEFORMATEXTENSIBLE
+    let wave_format_ex = create_hardcoded_wave_format();
+    let wave_format_ptr = &wave_format_ex.Format as *const WAVEFORMATEX;
+    
+    // Initialize audio client with our hard-coded format
     let buffer_duration_ms = 10;
     let buffer_duration_100ns = buffer_duration_ms * REFTIMES_PER_MILLISEC;
     
@@ -140,9 +167,6 @@ unsafe fn initialize_audio_capture(audio_source: &AudioSource) -> Result<(IAudio
         None,
     )?;
     
-    // Free wave format memory (after we've extracted the format information)
-    CoTaskMemFree(Some(wave_format_ptr as *const _));
-    
     // Set event handle
     client.SetEventHandle(handle)?;
     
@@ -152,23 +176,32 @@ unsafe fn initialize_audio_capture(audio_source: &AudioSource) -> Result<(IAudio
     // Start audio client
     client.Start()?;
     
-    println!("Audio capture initialized and started");
+    println!("Audio capture initialized and started with format: {}Hz, {} channels, {}-bit",
+             HARD_CODED_SAMPLE_RATE, HARD_CODED_CHANNELS, HARD_CODED_BITS_PER_SAMPLE);
     
-    Ok((client, capture_client, handle, sample_rate, channels, bits_per_sample))
+    Ok((client, capture_client, handle, HARD_CODED_SAMPLE_RATE, HARD_CODED_CHANNELS, HARD_CODED_BITS_PER_SAMPLE))
 }
 
 impl CaptureAudioGenerator {
-    pub fn new(audio_source: AudioSource) -> Result<Self> {
-        // Create shared atomic variables with default values
-        let sample_rate = Arc::new(AtomicU32::new(DEFAULT_SAMPLE_RATE));
-        let channels = Arc::new(AtomicU16::new(DEFAULT_CHANNELS));
-        let bits_per_sample = Arc::new(AtomicU16::new(DEFAULT_BITS_PER_SAMPLE));
+    pub fn new(audio_source: AudioSource, start_qpc: i64) -> Result<Self> {
+        // Create shared atomic variables with hard-coded values
+        let sample_rate = Arc::new(AtomicU32::new(HARD_CODED_SAMPLE_RATE));
+        let channels = Arc::new(AtomicU16::new(HARD_CODED_CHANNELS));
+        let bits_per_sample = Arc::new(AtomicU16::new(HARD_CODED_BITS_PER_SAMPLE));
         let initialized = Arc::new(AtomicBool::new(false));
         
-        // Create buffer with 2 seconds capacity
-        let buffer_size = DEFAULT_SAMPLE_RATE as usize * DEFAULT_CHANNELS as usize * 2; // 2 seconds
+        // Get the QPC frequency for timestamp calculations
+        let mut qpf_frequency: i64 = 0;
+        unsafe {
+            QueryPerformanceFrequency(&mut qpf_frequency);
+        }
+        println!("QPC frequency: {}", qpf_frequency);
         
-        let rb = HeapRb::<f32>::new(buffer_size);
+        // Create buffer for AudioSample structs
+        // Use a smaller capacity since AudioSample structs are larger
+        let buffer_size = 100; // This should be tuned based on expected packet sizes
+        
+        let rb = HeapRb::<AudioSample>::new(buffer_size);
         let (mut producer, consumer) = rb.split();
         
         // Create control channel
@@ -180,10 +213,12 @@ impl CaptureAudioGenerator {
         let thread_channels = channels.clone();
         let thread_bits_per_sample = bits_per_sample.clone();
         let thread_initialized = initialized.clone();
+        let thread_start_qpc = start_qpc;
+        let thread_qpf_frequency = qpf_frequency;
 
         // Create session object
         let session = AudioCaptureSession::new(control_sender);
-        println!("created session");
+        println!("Created session");
         
         // Start audio capture thread
         thread::spawn(move || {
@@ -261,31 +296,52 @@ impl CaptureAudioGenerator {
                             let mut buffer_data_ptr = std::ptr::null_mut();
                             let mut num_frames_available = 0;
                             let mut flags = 0;
-                            let mut position: u64 = 0;
+                            let mut qpc_position: u64 = 0;
                             
                             let capture_result = capture_client.GetBuffer(
                                 &mut buffer_data_ptr,
                                 &mut num_frames_available,
                                 &mut flags,
-                                Some(&mut position),
-                                None
+                                Some(&mut qpc_position),
+                                Some(&mut qpc_position), // Request QPC timestamp
                             );
                             
                             if capture_result.is_ok() && num_frames_available > 0 {
-                                // Get current channel count from atomic
+                                // Get current channel count and bits per sample
                                 let current_channels = thread_channels.load(Ordering::SeqCst);
+                                let current_bits_per_sample = thread_bits_per_sample.load(Ordering::SeqCst);
+                                let bytes_per_sample = (current_bits_per_sample / 8) as usize;
+                                let current_sample_rate = thread_sample_rate.load(Ordering::SeqCst);
                                 
-                                // Convert the buffer to a slice of f32 values
+                                // Calculate buffer size in bytes
+                                let buffer_size_bytes = num_frames_available as usize * current_channels as usize * bytes_per_sample;
+                                
+                                // Convert the buffer to a slice of bytes
                                 let buffer_slice = std::slice::from_raw_parts(
-                                    buffer_data_ptr as *const f32,
-                                    num_frames_available as usize * current_channels as usize
+                                    buffer_data_ptr as *const u8,
+                                    buffer_size_bytes
                                 );
                                 
-                                // Push the data to the ring buffer
-                                for &sample in buffer_slice {
-                                    if producer.try_push(sample).is_err() {
-                                        println!("Buffer overflow - consumer not keeping up");
-                                    }
+                                // Calculate timestamp and duration
+                                // Convert QPC timestamp to relative time in 100ns units
+                                let qpc_signed = qpc_position as i64;
+                                let relative_timestamp_hns = ((qpc_signed - thread_start_qpc) * REFTIMES_PER_SEC) / thread_qpf_frequency;
+                                let packet_duration_hns = (num_frames_available as i64 * REFTIMES_PER_SEC) / current_sample_rate as i64;
+                                
+                                // Create TimeSpan objects
+                                let timestamp = TimeSpan { Duration: relative_timestamp_hns };
+                                let duration = TimeSpan { Duration: packet_duration_hns };
+                                
+                                // Create an AudioSample and push it to the ring buffer
+                                let audio_sample = AudioSample {
+                                    data: buffer_slice.to_vec(),
+                                    timestamp,
+                                    duration,
+                                    frames: num_frames_available,
+                                };
+                                
+                                if producer.try_push(audio_sample).is_err() {
+                                    println!("Buffer overflow - consumer not keeping up");
                                 }
                                 
                                 // Release the buffer
@@ -320,11 +376,12 @@ impl CaptureAudioGenerator {
             channels,
             bits_per_sample,
             initialized,
-            sample_position: 0,
+            start_qpc,
+            qpf_frequency,
         })
     }
     
-    // New method to wait until initialization completes
+    // Wait until initialization completes
     pub fn wait_for_initialization(&self, timeout_ms: u64) -> Result<()> {
         let start = std::time::Instant::now();
         while !self.initialized.load(Ordering::SeqCst) {
@@ -350,44 +407,17 @@ impl CaptureAudioGenerator {
         &self.session
     }
     
-    // Method to retrieve audio samples
-    pub fn try_get_audio_samples(&mut self, buffer: &mut [f32], max_samples: usize) -> Option<usize> {
-        let mut count = 0;
-        
-        while count < max_samples && !self.consumer.is_empty() {
-            if let Some(sample) = self.consumer.try_pop() {
-                if count < buffer.len() {
-                    buffer[count] = sample;
-                    count += 1;
-                } else {
-                    break;
-                }
-            }
+    // Method to retrieve audio samples - now returns AudioSample structs
+    pub fn try_get_audio_sample(&mut self) -> Option<AudioSample> {
+        if !self.consumer.is_empty() {
+            self.consumer.try_pop()
+        } else {
+            None
         }
-        
-        // Update sample position for timing calculations
-        self.sample_position += count as u64;
-        
-        Some(count)
-    }
-    
-    // Get current sample position for timestamp calculations
-    pub fn get_sample_position(&self) -> u64 {
-        self.sample_position
-    }
-    
-    // Get sample time in 100ns units for Media Foundation
-    pub fn get_sample_time(&self) -> i64 {
-        (self.sample_position * 10000000 / self.get_sample_rate() as u64) as i64
-    }
-    
-    // Calculate duration for a given number of samples
-    pub fn calculate_duration(&self, sample_count: usize) -> i64 {
-        (sample_count as i64 * 10000000 / self.get_sample_rate() as i64)
     }
     
     pub fn stop_capture(&mut self) -> Result<()> {
-        self.session.Close()
+        self.session.StopCapture()
     }
     
     // Check if initialization is complete
@@ -404,8 +434,13 @@ impl CaptureAudioGenerator {
         self.channels.load(Ordering::SeqCst)
     }
     
-    // New method to get bits per sample
     pub fn get_bits_per_sample(&self) -> u16 {
         self.bits_per_sample.load(Ordering::SeqCst)
+    }
+    
+    // Method to calculate time from QPC value
+    pub fn qpc_to_time(&self, qpc: i64) -> TimeSpan {
+        let relative_time_hns = ((qpc - self.start_qpc) * REFTIMES_PER_SEC) / self.qpf_frequency;
+        TimeSpan { Duration: relative_time_hns }
     }
 }

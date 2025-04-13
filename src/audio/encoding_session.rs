@@ -16,7 +16,7 @@ use windows::{
             Gdi::HMONITOR,
         },
         Media::{Audio::{IAudioClient, IMMDevice}, MediaFoundation::{
-            IMFMediaType, IMFSample, IMFSinkWriter, MFAudioFormat_PCM, MFCreateAttributes, MFCreateMFByteStreamOnStreamEx, MFCreateSinkWriterFromURL
+            IMFMediaType, IMFSample, IMFSinkWriter, MFAudioFormat_AAC, MFAudioFormat_PCM, MFCreateAttributes, MFCreateMFByteStreamOnStreamEx, MFCreateSinkWriterFromURL
         }},
         System::{Com::CLSCTX_ALL, Performance::QueryPerformanceFrequency}
     },
@@ -25,7 +25,7 @@ use windows::{
 use crate::{audio::capture_audio::{CaptureAudioGenerator}, encoding_session::SampleWriter};
 
 use super::{
-    capture_audio::AudioCaptureSession, capture_microphone::{CaptureMicrophoneGenerator, MicrophoneCaptureSession}, encoder::{AudioEncoder, AudioEncoderInputSample}, encoder_device::{AudioEncoderDevice}, processor::{AudioFormat, AudioProcessor}
+    capture_audio::{AudioCaptureSession, AudioSample}, capture_microphone::{CaptureMicrophoneGenerator, MicrophoneCaptureSession}, encoder::{AudioEncoder, AudioEncoderInputSample}, encoder_device::AudioEncoderDevice, processor::{AudioFormat, AudioProcessor}
 };
 
 #[derive(Clone)]
@@ -35,9 +35,10 @@ pub enum AudioSource {
 }
 
 pub struct AudioEncodingSession {
-    audio_encoder: AudioEncoder,
     audio_capture_session: Option<AudioCaptureSession>,
     microphone_capture_session: Option<MicrophoneCaptureSession>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    processing_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 struct SampleGenerator {
@@ -61,61 +62,155 @@ impl AudioEncodingSession {
         bit_rate: u32,
         sample_writer: Arc<SampleWriter>,
     ) -> Result<Self> {
-        let mut audio_encoder = AudioEncoder::new(
-            &encoder_device,
-48000,
-            2,
-            8,
-        )?;
-
+        // Your existing format setup code remains the same
         let output_format = AudioFormat {
-            sample_rate: 48000,    // 48kHz is standard for professional audio
-            channels: 2,           // Stereo output
-            bits_per_sample: 32,   // 16-bit PCM is widely compatible
-            channel_mask: Some(3), // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT (0x1 | 0x2)
-            format: MFAudioFormat_PCM, // PCM format for compatibility
+            sample_rate: 48000,
+            channels: 2,
+            bits_per_sample: 16,
+            channel_mask: Some(0x3),
+            format: MFAudioFormat_AAC,
         };
-
-        let mut sample_generator = SampleGenerator::new(
+    
+        let capture_format = AudioFormat {
+            sample_rate: 48000,
+            channels: 2,
+            bits_per_sample: 16,
+            channel_mask: Some(3),
+            format: MFAudioFormat_PCM,
+        };
+    
+        // Create the sample generator outside the thread as it's still needed
+        let sample_generator = SampleGenerator::new(
             true,
             AudioSource::Desktop,
             false, 
             None,
-            output_format,
+            output_format.clone(),
             None,
         )?;
         println!("created sample gen");
+        
+        // Store references to capture sessions
         let audio_capture_session = sample_generator.audio_capture_session().clone();
         let microphone_capture_session = sample_generator.microphone_capture_session().clone();
-        audio_encoder.set_sample_requested_callback(
-            move || -> Result<Option<AudioEncoderInputSample>> { sample_generator.generate() },
-        );
-
-        audio_encoder.set_sample_rendered_callback({
-            let sample_writer = sample_writer.clone();
-            move |sample| -> Result<()> { sample_writer.write_audio_sample(sample.sample()) }
+    
+        // Only wrap the sample generator in a thread-safe wrapper
+        let sample_generator = Arc::new(std::sync::Mutex::new(sample_generator));
+        
+        // Clone for thread
+        let sample_generator_thread = sample_generator.clone();
+        let sample_writer_thread = sample_writer.clone();
+        
+        // Capture encoder configuration for the thread
+        let encoder_device_clone = encoder_device.clone();
+        let output_format_clone = output_format.clone();
+        let capture_format_clone = capture_format.clone();
+        
+        // Set up a flag to control the thread
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let running_thread = running.clone();
+        
+        // Create the processing thread
+        let processing_thread = std::thread::spawn(move || {
+            // Create the audio encoder inside the thread
+            let mut audio_encoder = match AudioEncoder::new(
+                &encoder_device_clone,
+                capture_format_clone,
+                output_format,
+                Some(bit_rate)
+            ) {
+                Ok(encoder) => encoder,
+                Err(e) => {
+                    eprintln!("Failed to create audio encoder in thread: {:?}", e);
+                    return; // Exit thread if encoder creation fails
+                }
+            };
+            
+            while running_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                // Try to get the next sample
+                if let Ok(mut generator) = sample_generator_thread.lock() {
+                    match generator.generate() {
+                        Ok(Some(sample)) => {
+                            // Process the sample with the encoder (no mutex needed now)
+                            match audio_encoder.process_sample(&sample) {
+                                Ok(Some(encoded_sample)) => {
+                                    // Write the encoded sample
+                                    if let Err(e) = sample_writer_thread.write_audio_sample(encoded_sample.sample()) {
+                                        eprintln!("Error writing audio sample: {:?}", e);
+                                    }
+                                },
+                                Ok(None) => {
+                                    // No encoded sample was produced, perhaps buffering
+                                    // This is normal for some encoders
+                                },
+                                Err(e) => eprintln!("Error processing audio sample: {:?}", e),
+                            }
+                        },
+                        Ok(None) => {
+                            // No sample available, sleep briefly to avoid busy-waiting
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        },
+                        Err(e) => eprintln!("Error generating audio sample: {:?}", e),
+                    }
+                }
+            }
+            
+            // Drain any buffered samples when stopping
+            match audio_encoder.drain() {
+                Ok(encoded_samples) => {
+                    // Write any remaining encoded samples
+                    for encoded_sample in encoded_samples {
+                        if let Err(e) = sample_writer_thread.write_audio_sample(encoded_sample.sample()) {
+                            eprintln!("Error writing drained audio sample: {:?}", e);
+                        }
+                    }
+                },
+                Err(e) => eprintln!("Error draining audio encoder: {:?}", e),
+            }
         });
-
+        
         Ok(Self {
-            audio_encoder,
             audio_capture_session,
-            microphone_capture_session
+            microphone_capture_session,
+            running,
+            processing_thread: Some(processing_thread),
         })
     }
 
     pub fn start(&mut self) -> Result<()> {
+        // Start the capture sessions
         if let Some(session) = &mut self.audio_capture_session {
             session.StartCapture()?;
         }
         if let Some(session) = &mut self.microphone_capture_session {
-           session.StartCapture()?;
-       }
-        assert!(self.audio_encoder.try_start()?);
+            session.StartCapture()?;
+        }
+        
+        // Set the running flag to true to activate the processing thread
+        self.running.store(true, std::sync::atomic::Ordering::Relaxed);
+        
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<()> {
-        self.audio_encoder.stop()?;
+        // Set the running flag to false to stop the processing thread
+        self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+        
+        // Wait for the processing thread to finish
+        if let Some(thread) = self.processing_thread.take() {
+            if let Err(e) = thread.join() {
+                eprintln!("Error joining processing thread: {:?}", e);
+            }
+        }
+        
+        // Stop the capture sessions
+        if let Some(session) = &mut self.audio_capture_session {
+            session.StopCapture()?;
+        }
+        if let Some(session) = &mut self.microphone_capture_session {
+            session.StopCapture()?;
+        }
+        
         Ok(())
     }
 }
@@ -138,7 +233,7 @@ impl SampleGenerator {
 
         if capture_audio {
             // Create the audio generator
-            let mut temp_audio_generator = CaptureAudioGenerator::new(audio_source)?;
+            let mut temp_audio_generator = CaptureAudioGenerator::new(audio_source, 0)?;
             println!("created capture audio gen");
             // Start capture and wait for initialization with 500ms timeout
             temp_audio_generator.start_capture_and_wait(500)?;
@@ -153,11 +248,11 @@ impl SampleGenerator {
             };
             
             audio_generator = Some(temp_audio_generator);
-            audio_processor = Some(AudioProcessor::new(
+            /*audio_processor = Some(AudioProcessor::new(
                 audio_input_format,
                 output_format.clone(),
                 quality,
-            )?);
+            )?);*/
         }
 
         /*if capture_microphone {
@@ -208,140 +303,37 @@ impl SampleGenerator {
     }
 
     pub fn generate(&mut self) -> Result<Option<AudioEncoderInputSample>> {
-        // Define buffer size based on your requirements
-        let max_samples = 1024; // Adjust based on your needs
-        let mut audio_buffer = vec![0.0f32; max_samples];
-        let mut mic_buffer = vec![0.0f32; max_samples];
-        
-        // 1. Try get both audio sources
-        let mut audio_samples = 0;
-        let mut mic_samples = 0;
-        
-        // Get audio samples if available
-        if let Some(generator) = &mut self.audio_generator {
-            if let Some(count) = generator.try_get_audio_samples(&mut audio_buffer, max_samples) {
-                audio_samples = count;
-            }
-        }
-        
-        // Get microphone samples if available
-        if let Some(generator) = &mut self.microphone_generator {
-            if let Some(count) = generator.try_get_audio_samples(&mut mic_buffer, max_samples) {
-                mic_samples = count;
-            }
-        }
-        
-        // If no samples available from either source, end capture
-        if audio_samples == 0 && mic_samples == 0 {
-            self.stop_capture()?;
-            return Ok(None);
-        }
-        
-        // Calculate current timestamp and duration based on sample position and rate
-        let sample_rate = self.audio_generator
-            .as_ref()
-            .map(|g| g.get_sample_rate())
-            .unwrap_or(48000) as f64;
-            
-        let current_time = if !self.seen_first_time_stamp {
-            // Initialize timing on first batch of samples
-            self.first_timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as i64;
-            self.seen_first_time_stamp = true;
-            
-            TimeSpan { Duration: 0 }
-        } else {
-            // For subsequent samples, calculate relative time based on sample position
-            let time_in_seconds = self.total_samples_processed as f64 / sample_rate;
-            let duration_100ns = (time_in_seconds * 10_000_000.0) as i64;
-            
-            TimeSpan { Duration: duration_100ns }
-        };
-        
-        // Calculate duration for this batch of samples (critical for AAC encoding)
-        let samples_this_batch = audio_samples.max(mic_samples) as f64;
-        let duration_in_seconds = samples_this_batch / sample_rate;
-        let duration_100ns = (duration_in_seconds * 10_000_000.0) as i64;
-        let duration = TimeSpan { Duration: duration_100ns };
-        
-        // Convert float samples to bytes for IMFSample creation - moved out of nested blocks
-        // to avoid borrowing conflicts
-        let audio_bytes = if audio_samples > 0 {
-            self.float_to_bytes(&audio_buffer[0..audio_samples])
-        } else {
-            Vec::new()
-        };
-        
-        let mic_bytes = if mic_samples > 0 {
-            self.float_to_bytes(&mic_buffer[0..mic_samples])
-        } else {
-            Vec::new()
-        };
-        
-        // 2. Process both audio sources
-        let processed_audio = if audio_samples > 0 {
-            if let Some(processor) = &mut self.audio_processor {
-                // Create an IMFSample through from_raw
-                let audio_sample = AudioEncoderInputSample::from_raw(
-                    &audio_bytes,
-                    current_time,
-                    duration
-                )?;
-                
-                // Process the sample and extract resulting IMFSample
-                let processed_sample = processor.process_sample(&audio_sample.sample())?;
-                
-                processed_sample
-            } else {
-                None
-            }
+        // Try to get audio samples from both sources
+        let audio_sample = if let Some(generator) = &mut self.audio_generator {
+            generator.try_get_audio_sample()
         } else {
             None
         };
         
-        let processed_mic = if mic_samples > 0 {
-            if let Some(processor) = &mut self.microphone_processor {
-                // Create an IMFSample through from_raw
-                let mic_sample = AudioEncoderInputSample::from_raw(
-                    &mic_bytes,
-                    current_time,
-                    duration
-                )?;
-                
-                // Process the sample and extract resulting IMFSample
-                let processed_sample = processor.process_sample(&mic_sample.sample())?;
-                
-                processed_sample
-            } else {
-                None
-            }
+        let mic_sample = if let Some(generator) = &mut self.microphone_generator {
+            generator.try_get_audio_sample()
         } else {
             None
         };
         
-        // Track total samples processed for timing
-        self.total_samples_processed += audio_samples.max(mic_samples) as i64;
-        
-        // 3. Mix if needed
-        if processed_audio.is_some() && processed_mic.is_some() {
+        // Check if we have both audio and mic samples
+        if let (Some(audio), Some(mic)) = (&audio_sample, &mic_sample) {
             // Both sources available, mix them
-            return Ok(Some(self.mix_audio_samples(
-                processed_audio.unwrap(),
-                processed_mic.unwrap(),
-                current_time,
-                duration
-            )?));
-        } else if let Some(audio) = processed_audio {
-            // Only system audio available
-            return Ok(Some(AudioEncoderInputSample::new(audio)));
-        } else if let Some(mic) = processed_mic {
-            // Only microphone audio available
-            return Ok(Some(AudioEncoderInputSample::new(mic)));
+            return Ok(Some(self.mix_audio_samples(audio.clone(), mic.clone())?));
         }
         
-        // Should never reach here given the earlier check
+        // If we didn't have both, check for individual sources
+        if let Some(audio) = audio_sample {
+            // Only system audio available
+            return Ok(Some(self.convert_to_encoder_input(audio)?));
+        }
+        
+        if let Some(mic) = mic_sample {
+            // Only microphone audio available
+            return Ok(Some(self.convert_to_encoder_input(mic)?));
+        }
+        
+        // No samples available
         Ok(None)
     }
     
@@ -359,7 +351,7 @@ impl SampleGenerator {
         Ok(())
     }
     
-    // Helper to convert float samples to bytes
+    // Helper to convert float samples to bytes - still needed for mixing
     fn float_to_bytes(&self, samples: &[f32]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(samples.len() * 4);
         for sample in samples {
@@ -371,17 +363,15 @@ impl SampleGenerator {
     
     fn mix_audio_samples(
         &mut self,
-        audio_sample: IMFSample,
-        mic_sample: IMFSample,
-        timestamp: TimeSpan,
-        duration: TimeSpan
+        audio_sample: &AudioSample,
+        mic_sample: &AudioSample
     ) -> Result<AudioEncoderInputSample> {
         // Extract audio data from both samples
-        let (audio_data, audio_len) = self.extract_float_data_from_sample(&audio_sample)?;
-        let (mic_data, mic_len) = self.extract_float_data_from_sample(&mic_sample)?;
+        let audio_data = self.extract_float_data_from_audio_sample(&audio_sample);
+        let mic_data = self.extract_float_data_from_audio_sample(&mic_sample);
         
         // Create a new buffer for the mixed audio
-        let mix_len = audio_len.min(mic_len);
+        let mix_len = audio_data.len().min(mic_data.len());
         let mut mixed_data = vec![0.0f32; mix_len];
         
         // Apply mixing with level control
@@ -396,45 +386,47 @@ impl SampleGenerator {
         // Convert mixed float data to bytes
         let mixed_bytes = self.float_to_bytes(&mixed_data);
         
-        // Create the final sample using from_raw
-        AudioEncoderInputSample::from_raw(
-            &mixed_bytes,
-            timestamp,
-            duration
-        )
+        // Use timestamp and duration from audio_sample for the mixed result
+        // (We could also choose the earlier timestamp if they differ, but
+        // they should be synchronized in most cases)
+        Ok(AudioEncoderInputSample::new(
+            mixed_bytes,
+            audio_sample.timestamp,
+            audio_sample.duration,
+            0
+        ))
     }
     
-    // Helper to extract float data from an IMFSample
-    fn extract_float_data_from_sample(&self, sample: &IMFSample) -> Result<(Vec<f32>, usize)> {
-        unsafe {
-            // Get the first buffer
-            let buffer = sample.GetBufferByIndex(0)?;
-            
-            // Lock the buffer to read data
-            let mut data_ptr = std::ptr::null_mut();
-            let mut max_length = 0;
-            let mut current_length = 0;
-            buffer.Lock(&mut data_ptr, Some(&mut max_length), Some(&mut current_length))?;
-            
-            // Calculate how many float samples we have
-            let sample_count = current_length as usize / std::mem::size_of::<f32>();
-            
-            // Create a vector to hold the samples
-            let mut samples = vec![0.0f32; sample_count];
-            
-            // Copy the data
-            std::ptr::copy_nonoverlapping(
-                data_ptr as *const f32,
-                samples.as_mut_ptr(),
-                sample_count
-            );
-            
-            // Unlock the buffer
-            buffer.Unlock()?;
-            
-            Ok((samples, sample_count))
+    // Helper to extract float data from an AudioSample
+    fn extract_float_data_from_audio_sample(&self, sample: &AudioSample) -> Vec<f32> {
+        // Calculate how many float samples we have
+        let bytes_per_sample = 4; // 32-bit float
+        let sample_count = sample.data.len() / bytes_per_sample;
+        
+        // Create a vector to hold the samples
+        let mut samples = vec![0.0f32; sample_count];
+        
+        // Convert the bytes to floats
+        for i in 0..sample_count {
+            let start = i * bytes_per_sample;
+            let mut byte_array = [0u8; 4];
+            byte_array.copy_from_slice(&sample.data[start..start+4]);
+            samples[i] = f32::from_le_bytes(byte_array);
         }
+        
+        samples
     }
+    
+    // Helper to convert AudioSample to AudioEncoderInputSample
+    fn convert_to_encoder_input(&self, audio_sample: AudioSample) -> Result<AudioEncoderInputSample> {
+        Ok(AudioEncoderInputSample::new(
+            audio_sample.data,
+            audio_sample.timestamp,
+            audio_sample.duration,
+            0
+        ))
+    }
+    
 }
 
 const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];

@@ -41,11 +41,11 @@ pub struct AudioFormat {
 
 impl AudioFormat {
     // Calculate derived values needed for WAVEFORMATEX / MF_MT_*
-    fn block_align(&self) -> u16 {
+    pub fn block_align(&self) -> u16 {
         self.channels * (self.bits_per_sample / 8)
     }
 
-    fn avg_bytes_per_second(&self) -> u32 {
+    pub fn avg_bytes_per_second(&self) -> u32 {
         self.sample_rate * self.block_align() as u32
     }
 }

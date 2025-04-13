@@ -1,110 +1,34 @@
-use std::{
-    mem::ManuallyDrop, // Needed for ProcessOutput buffer management
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    thread::JoinHandle,
-    // time::{SystemTime, UNIX_EPOCH}, // Keep if you want debug timing prints
-};
-
 use windows::{
-    core::{ComInterface, Error, Result},
-    Foundation::TimeSpan,
-    Win32::{
-        Foundation::E_NOTIMPL,
+    core::{ComInterface, Interface, Result, GUID, HRESULT}, Foundation::TimeSpan, Win32::{
+        Foundation::S_OK,
         Media::MediaFoundation::{
             // Interfaces
-            IMFAttributes, IMFMediaEventGenerator, IMFMediaType, IMFSample,
-            IMFTransform,
-            // Functions
-            MFCreateMemoryBuffer, MFCreateMediaType, MFCreateSample, MFStartup,
-            // Constants & Enums
-            METransformHaveOutput, METransformNeedInput, MFMediaType_Audio,
-            MFSTARTUP_FULL, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-            MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_END_STREAMING,
-            MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
-            // Needed for ProcessOutput status
-            MFT_SET_TYPE_TEST_ONLY, MF_EVENT_TYPE, MF_E_INVALIDMEDIATYPE,
-            MF_E_NO_MORE_TYPES, MF_E_TRANSFORM_TYPE_NOT_SET,
-            // MF_TRANSFORM_ASYNC_UNLOCK, // May still be useful
-            MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS,
-            // Audio Attributes (Add more as needed)
-            MFAudioFormat_AAC, MFAudioFormat_PCM,
-            MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE,
-            MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_NUM_CHANNELS,
-            MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+            IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFAudioFormat_AAC, MFAudioFormat_Float, MFAudioFormat_PCM, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Audio, MFVideoInterlace_Progressive, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, MF_MT_AAC_PAYLOAD_TYPE, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_CHANNEL_MASK, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE
         },
-        // System::Performance::{QueryPerformanceFrequency, QueryPerformanceCounter}, // Keep if needed for timing
-    },
+        System::{
+            Com::StructuredStorage::PROPVARIANT,
+            Variant::VT_UI4,
+        },
+        UI::Shell::PropertiesSystem::{IPropertyStore, PROPERTYKEY},
+    }
 };
 
-use crate::video::encoder_device::VideoEncoderDevice;
-
-use super::encoder_device::AudioEncoderDevice;
-
-// Represents one chunk of input audio data for the encoder
-// Contains the IMFSample holding an IMFMediaBuffer with PCM/Float data
 #[derive(Clone)]
 pub struct AudioEncoderInputSample {
-    sample: IMFSample,
+    pub data: Vec<u8>,
+    pub timestamp: TimeSpan,
+    pub duration: TimeSpan,
+    pub frames: u32,
 }
 
 impl AudioEncoderInputSample {
-    // Constructor now takes an IMFSample directly
-    pub fn new(sample: IMFSample) -> Self {
-        Self { sample }
-    }
-
-    // Helper to create a sample from raw bytes, timestamp, and duration
-    // Note: Duration is important for AAC encoding
-    pub fn from_raw(
-        data: &[u8],
-        timestamp: TimeSpan,
-        duration: TimeSpan,
-    ) -> Result<Self> {
-        unsafe {
-            let buffer = MFCreateMemoryBuffer(data.len() as u32)?;
-            // Lock buffer to copy data
-            let mut buffer_ptr = std::ptr::null_mut();
-            let mut max_len = 0;
-            buffer.Lock(&mut buffer_ptr, None, Some(&mut max_len))?;
-            if max_len >= data.len() as u32 {
-                 std::ptr::copy_nonoverlapping(data.as_ptr(), buffer_ptr, data.len());
-            } else {
-                 // Handle error: buffer too small (shouldn't happen with MFCreateMemoryBuffer)
-                 buffer.Unlock()?; // Unlock before erroring
-                 return Err(Error::new(windows::Win32::Foundation::E_FAIL, "Failed to lock buffer sufficiently".into()));
-            }
-            buffer.SetCurrentLength(data.len() as u32)?;
-            buffer.Unlock()?;
-
-
-            let mf_sample = MFCreateSample()?;
-            mf_sample.AddBuffer(&buffer)?;
-            mf_sample.SetSampleTime(timestamp.Duration)?;
-            mf_sample.SetSampleDuration(duration.Duration)?;
-            Ok(Self::new(mf_sample))
-        }
-    }
-
-     pub fn sample(&self) -> &IMFSample {
-        &self.sample
-    }
-
-    pub fn timestamp(&self) -> Result<TimeSpan> {
-        let time = unsafe { self.sample.GetSampleTime()? };
-        Ok(TimeSpan { Duration: time })
-    }
-
-    pub fn duration(&self) -> Result<TimeSpan> {
-        let duration = unsafe { self.sample.GetSampleDuration()? };
-        Ok(TimeSpan { Duration: duration })
+    pub fn new(data: Vec<u8>, timestamp: TimeSpan, duration: TimeSpan, frames: u32) -> Self {
+        Self { data, timestamp, duration, frames }
     }
 }
 
 pub struct AudioEncoderOutputSample {
-    sample: IMFSample
+    sample: IMFSample,
 }
 
 impl AudioEncoderOutputSample {
@@ -113,318 +37,415 @@ impl AudioEncoderOutputSample {
     }
 }
 
-pub struct AudioEncoder {
-    inner: Option<AudioEncoderInner>,
-    output_type: IMFMediaType,
-    started: AtomicBool,
-    should_stop: Arc<AtomicBool>,
-    encoder_thread_handle: Option<JoinHandle<Result<()>>>,
-}
+use std::mem::{ManuallyDrop};
 
-struct AudioEncoderInner {
-    transform: IMFTransform,
-    event_generator: IMFMediaEventGenerator,
+use crate::video::encoder;
+
+use super::{encoder_device::AudioEncoderDevice, processor::AudioFormat};
+
+pub struct AudioEncoder {
+    encoder_transform: IMFTransform,
+    input_media_type: IMFMediaType,
+    output_media_type: IMFMediaType,
     input_stream_id: u32,
     output_stream_id: u32,
-
-    sample_requested_callback:
-        Option<Box<dyn Send + FnMut() -> Result<Option<AudioEncoderInputSample>>>>,
-    sample_rendered_callback: Option<Box<dyn Send + FnMut(AudioEncoderOutputSample) -> Result<()>>>,
-
-    should_stop: Arc<AtomicBool>,
+    output_buffer_size: u32,
 }
 
 impl AudioEncoder {
     pub fn new(
         encoder_device: &AudioEncoderDevice,
-        output_sample_rate: u32,
-        output_channels: u16,
-        output_bitrate: u32,
+        input_format: AudioFormat,
+        output_format: AudioFormat, 
+        bitrate: Option<u32>,
     ) -> Result<Self> {
-        let transform = encoder_device.create_transform()?;
-    
-        // Setup MFTransform
-        let event_generator: IMFMediaEventGenerator = transform.cast()?;
-    
-        // Get Stream IDs (usually 0 for input/output on audio encoders)
-        let mut number_of_input_streams = 0;
-        let mut number_of_output_streams = 0;
+        // Create the encoder transform using the provided device
+        let encoder_transform = encoder_device.create_transform()?;
+        
+        // Create Media Types
+        let input_media_type = create_audio_media_type(&input_format)?;
+        
+        // For output, we need to set encoder-specific attributes for AAC
+        let output_media_type = create_aac_output_media_type(&output_format, bitrate)?;
+        
+        // Set Media Types on the Transform
         unsafe {
-            transform.GetStreamCount(&mut number_of_input_streams, &mut number_of_output_streams)?
-        };
-        let (input_stream_ids, output_stream_ids) = {
-            let mut input_stream_ids = vec![0u32; number_of_input_streams as usize];
-            let mut output_stream_ids = vec![0u32; number_of_output_streams as usize];
-            let result =
-                unsafe { transform.GetStreamIDs(&mut input_stream_ids, &mut output_stream_ids) };
-            match result {
-                Ok(_) => {}
-                Err(error) => {
-                    // https://docs.microsoft.com/en-us/windows/win32/api/mftransform/nf-mftransform-imftransform-getstreamids
-                    // This method can return E_NOTIMPL if both of the following conditions are true:
-                    //   * The transform has a fixed number of streams.
-                    //   * The streams are numbered consecutively from 0 to n – 1, where n is the
-                    //     number of input streams or output streams. In other words, the first
-                    //     input stream is 0, the second is 1, and so on; and the first output
-                    //     stream is 0, the second is 1, and so on.
-                    if error.code() == E_NOTIMPL {
-                        for i in 0..number_of_input_streams {
-                            input_stream_ids[i as usize] = i;
-                        }
-                        for i in 0..number_of_output_streams {
-                            output_stream_ids[i as usize] = i;
-                        }
-                    } else {
-                        return Err(error);
-                    }
-                }
-            }
-            (input_stream_ids, output_stream_ids)
-        };
-        let input_stream_id = input_stream_ids[0];
-        let output_stream_id = output_stream_ids[0];
-    
-        // --- Set Output Media Type (AAC) directly --
-        let output_type = unsafe {
-            let output_type = MFCreateMediaType()?;
-            output_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-            output_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
-            output_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, output_sample_rate)?;
-            output_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, output_channels as u32)?;
-            // Bitrate is crucial for AAC
-            output_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, output_bitrate / 8)?; // Bps
-    
-            // Try setting the output type
-            transform.SetOutputType(output_stream_id, &output_type, 0)?; // No flags
-            output_type
-        };
-    
-        // --- Set Input Media Type (PCM/Float) directly --
-        let input_type: Option<IMFMediaType> = unsafe {
-            let mut count = 0;
-            loop {
-                let result = transform.GetInputAvailableType(input_stream_id, count);
-                if let Err(error) = &result {
-                    if error.code() == MF_E_NO_MORE_TYPES {
-                        break None;
-                    }
-                }
-
-                let input_type = result?;
-                let attributes: IMFAttributes = input_type.cast()?;
-                input_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
-                input_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
-                input_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000)?;
-                input_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2 as u32)?;
-                input_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 32 as u32)?;
-                input_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4)?;
-                input_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192000)?;
-                let result = transform.SetInputType(
-                    input_stream_id,
-                    &input_type,
-                    MFT_SET_TYPE_TEST_ONLY.0 as u32,
-                );
-                if let Err(error) = &result {
-                    if error.code() == MF_E_INVALIDMEDIATYPE {
-                        count += 1;
-                        continue;
-                    }
-                }
-                result?;
-                break Some(input_type);
-            }
-        };
-        if let Some(input_type) = input_type {
-            unsafe { transform.SetInputType(input_stream_id, &input_type, 0)? };
-        } else {
-            return Err(Error::new(
-                MF_E_TRANSFORM_TYPE_NOT_SET,
-                "No suitable input type found! Try a different set of encoding settings.".into(),
-            ));
+            encoder_transform.SetInputType(0, Some(&input_media_type), 0)?; // Stream ID 0, no flags
+            encoder_transform.SetOutputType(0, Some(&output_media_type), 0)?; // Stream ID 0, no flags
         }
-    
-        let should_stop = Arc::new(AtomicBool::new(false));
-        let inner = AudioEncoderInner {
-            transform,
-            event_generator,
+        
+        // Get Stream IDs
+        let mut input_ids = [0u32; 1]; // Expecting one input stream
+        let mut output_ids = [0u32; 1]; // Expecting one output stream
+        let input_stream_id;
+        let output_stream_id;
+        
+        unsafe {
+            // Note: GetStreamIDs might not be implemented by all MFTs. Defaulting to 0 is common.
+            match encoder_transform.GetStreamIDs(&mut input_ids[..], &mut output_ids[..]) {
+                Ok(_) => {
+                    input_stream_id = input_ids[0];
+                    output_stream_id = output_ids[0];
+                },
+                Err(e) => {
+                    // Don't fail completely, try assuming 0, but warn
+                    println!("Warning: IMFTransform::GetStreamIDs failed ({:?}), assuming stream IDs are 0.", e.code());
+                    input_stream_id = 0;
+                    output_stream_id = 0;
+                }
+            }
+        }
+        
+        // Get output stream info to estimate buffer size needed
+        let stream_info = unsafe { encoder_transform.GetOutputStreamInfo(output_stream_id)? };
+        // Ensure we have a sane minimum if cbSize is 0 (which can happen)
+        let output_buffer_size = if stream_info.cbSize > 0 { stream_info.cbSize } else { 32768 }; // 32KB min for encoded audio
+        
+        Ok(Self {
+            encoder_transform,
+            input_media_type,
+            output_media_type,
             input_stream_id,
             output_stream_id,
-    
-            sample_requested_callback: None,
-            sample_rendered_callback: None,
-
-            should_stop: should_stop.clone(),
-        };
-    
-        Ok(Self {
-            inner: Some(inner),
-            output_type, // Store the final output type
-            started: AtomicBool::new(false),
-            should_stop,
-            encoder_thread_handle: None,
+            output_buffer_size,
         })
     }
-
-    // --- Methods for starting, stopping, setting callbacks ---
-    // (These are largely identical to VideoEncoder, just replace type names)
-
-    pub fn try_start(&mut self) -> Result<bool> {
-        let mut result = false;
-        if self.started.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
-        {
-            let mut inner = self.inner.take().expect("Encoder inner state missing unexpectedly");
-
-            // Callbacks must both be set
-            if inner.sample_rendered_callback.is_none() || inner.sample_requested_callback.is_none()
-            {
-                panic!("Sample requested and rendered callbacks must be set before starting audio encoder");
-            }
-
-            // Start a seperate thread to drive the transform
-            self.encoder_thread_handle = Some(std::thread::spawn(move || -> Result<()> {
-                // Initialize COM for this thread (MFTs often require MTA or STA)
-                // Using MTA is generally safer for background threads unless MFT requires STA
-                // Or rely on MFStartup/MFShutdown to potentially handle this.
-                // CoInitializeEx(None, COINIT_MULTITHREADED)?; // Example MTA init
-                unsafe { MFStartup(crate::media::MF_VERSION, MFSTARTUP_FULL)? }; // Use MF_VERSION
-
-                let encode_result = inner.encode(); // Call the encoding loop
-
-                // Shutdown Media Foundation for this thread
-                // unsafe { MFShutdown()? }; // MFShutdown is global, call once at app exit
-                // CoUninitialize(); // Match CoInitializeEx
-
-                if encode_result.is_err() {
-                    println!("Audio encoding stopped unexpectedly: {:?}", encode_result);
+    
+    /// Processes a single input audio sample and returns the corresponding output sample(s).
+    /// For encoders, one input might not immediately produce an output due to buffering.
+    pub fn process_sample(&mut self, input_sample: &AudioEncoderInputSample) -> Result<Option<AudioEncoderOutputSample>> {
+        unsafe {
+            // Create an MF sample from the input sample
+            let input_mf_sample = MFCreateSample()?;
+            
+            // Create a buffer for the input data
+            let input_buffer = MFCreateMemoryBuffer(input_sample.data.len() as u32)?;
+            
+            // Get the buffer and copy the data into it
+            let mut buffer_data: *mut u8 = std::ptr::null_mut();
+            let mut max_length: u32 = 0;
+            input_buffer.Lock(&mut buffer_data, Some(&mut max_length), None)?;
+            
+            // Copy the data
+            std::ptr::copy_nonoverlapping(
+                input_sample.data.as_ptr(),
+                buffer_data,
+                input_sample.data.len()
+            );
+            
+            // Set the current length and unlock
+            input_buffer.SetCurrentLength(input_sample.data.len() as u32)?;
+            input_buffer.Unlock()?;
+            
+            // Add the buffer to the sample
+            input_mf_sample.AddBuffer(&input_buffer)?;
+            
+            // Set the sample attributes
+            input_mf_sample.SetSampleTime(input_sample.timestamp.Duration)?;
+            input_mf_sample.SetSampleDuration(input_sample.duration.Duration)?;
+    
+            // 1. Send input to the transform
+            match self.encoder_transform.ProcessInput(self.input_stream_id, &input_mf_sample, 0) {
+                Ok(_) => {}, // Input accepted
+                Err(e) => {
+                    // Handle specific errors if needed, e.g., MF_E_NOTACCEPTING
+                    println!("ProcessInput failed: {:?}", e);
+                    return Err(e.into());
                 }
-                encode_result // Return the result
-            }));
-            result = true;
+            }
+            
+            // 2. Try to get output - note that encoders often need multiple inputs before producing output
+            // Create necessary structures for ProcessOutput
+            
+            // Try to create a buffer of the suggested size - encoders often need larger buffers
+            let buffer_size = self.output_buffer_size;
+            let output_buffer = MFCreateMemoryBuffer(buffer_size)?;
+            
+            let output_sample = MFCreateSample()?;
+            output_sample.AddBuffer(&output_buffer)?;
+            
+            let mut output_data_buffer = MFT_OUTPUT_DATA_BUFFER {
+                dwStreamID: self.output_stream_id,
+                pSample: ManuallyDrop::new(Some(output_sample)),
+                dwStatus: 0, // Will be filled by ProcessOutput
+                pEvents: ManuallyDrop::new(None), // We don't process events here
+            };
+            let mut process_output_status: u32 = 0;
+            
+            // Create a slice as expected by ProcessOutput
+            let mut output_buffers = [output_data_buffer]; // Array of size 1
+            
+            match self.encoder_transform.ProcessOutput(
+                0, // Flags
+                &mut output_buffers, // Array of buffers
+                &mut process_output_status, // Status flags
+            ) {
+                Ok(_) => {
+                    // Success! We got an output sample.
+                    let filled_sample_option = ManuallyDrop::take(&mut output_buffers[0].pSample);
+                    
+                    // Ensure the MFT actually provided a sample
+                    let processed_sample = filled_sample_option.ok_or_else(|| {
+                        println!("Error: ProcessOutput succeeded but returned NULL sample pointer.");
+                        windows::core::Error::new(HRESULT(0x8000FFFFu32 as i32), "ProcessOutput succeeded but returned null sample".into()) // E_UNEXPECTED
+                    })?;
+                    
+                    // Update buffer length (important!)
+                    let filled_buffer: IMFMediaBuffer = processed_sample.GetBufferByIndex(0)?;
+                    let current_length = filled_buffer.GetCurrentLength()?;
+                    filled_buffer.SetCurrentLength(current_length)?; // Ensure length is set
+                    
+                    // Wrap in our output type
+                    let output = AudioEncoderOutputSample {
+                        sample: processed_sample
+                    };
+                    
+                    return Ok(Some(output));
+                }
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                    // Transform needs more input data before it can produce output.
+                    // This is common for encoders that buffer frames.
+                    let sample_to_drop = ManuallyDrop::take(&mut output_buffers[0].pSample);
+                    drop(sample_to_drop);
+                    
+                    let events_to_drop = ManuallyDrop::take(&mut output_buffers[0].pEvents);
+                    drop(events_to_drop);
+                    
+                    return Ok(None);
+                }
+                Err(e) => {
+                    // Any other error
+                    println!("ProcessOutput failed: {:?}", e);
+                    let sample_to_drop = ManuallyDrop::take(&mut output_buffers[0].pSample);
+                    drop(sample_to_drop);
+                    
+                    let events_to_drop = ManuallyDrop::take(&mut output_buffers[0].pEvents);
+                    drop(events_to_drop);
+                    
+                    return Err(e.into());
+                }
+            }
         }
-        Ok(result)
     }
 
-    pub fn stop(&mut self) -> Result<()> {
-        if self.started.load(Ordering::SeqCst) {
-            assert!(self
-                .should_stop
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok());
-            self.wait_for_completion()?;
+    /// Signal that no more input will be provided
+    /// This is important for encoders to flush their buffers
+    pub fn drain(&mut self) -> Result<Vec<AudioEncoderOutputSample>> {
+        let mut result_samples = Vec::new();
+        
+        unsafe {
+            // First, notify the encoder we're done with input
+            match self.encoder_transform.ProcessMessage(
+                windows::Win32::Media::MediaFoundation::MFT_MESSAGE_TYPE(
+                    windows::Win32::Media::MediaFoundation::MFT_MESSAGE_COMMAND_DRAIN.0
+                ), 
+                0
+            ) {
+                Ok(_) => {}, // Successfully set drain mode
+                Err(e) => {
+                    println!("Warning: Failed to set drain mode: {:?}", e);
+                    // We can still try to get remaining samples
+                }
+            }
+            
+            // Now try to get all remaining output samples
+            loop {
+                // Create buffer for output
+                let buffer_size = self.output_buffer_size;
+                let output_buffer = MFCreateMemoryBuffer(buffer_size)?;
+                
+                let output_sample = MFCreateSample()?;
+                output_sample.AddBuffer(&output_buffer)?;
+                
+                let mut output_data_buffer = MFT_OUTPUT_DATA_BUFFER {
+                    dwStreamID: self.output_stream_id,
+                    pSample: ManuallyDrop::new(Some(output_sample)),
+                    dwStatus: 0,
+                    pEvents: ManuallyDrop::new(None),
+                };
+                let mut process_output_status: u32 = 0;
+                
+                let mut output_buffers = [output_data_buffer];
+                
+                match self.encoder_transform.ProcessOutput(
+                    0,
+                    &mut output_buffers,
+                    &mut process_output_status,
+                ) {
+                    Ok(_) => {
+                        // Got another output sample during drain
+                        let filled_sample_option = ManuallyDrop::take(&mut output_buffers[0].pSample);
+                        
+                        if let Some(processed_sample) = filled_sample_option {
+                            // Update buffer length
+                            let filled_buffer: IMFMediaBuffer = processed_sample.GetBufferByIndex(0)?;
+                            let current_length = filled_buffer.GetCurrentLength()?;
+                            filled_buffer.SetCurrentLength(current_length)?;
+                            
+                            // Wrap in our output type
+                            let output = AudioEncoderOutputSample {
+                                sample: processed_sample
+                            };
+                            
+                            result_samples.push(output);
+                        } else {
+                            // No more samples but ProcessOutput succeeded - unusual
+                            println!("Warning: ProcessOutput during drain succeeded but returned NULL sample");
+                            break;
+                        }
+                    }
+                    Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => {
+                        // No more output can be produced, we're done draining
+                        let sample_to_drop = ManuallyDrop::take(&mut output_buffers[0].pSample);
+                        drop(sample_to_drop);
+                        
+                        let events_to_drop = ManuallyDrop::take(&mut output_buffers[0].pEvents);
+                        drop(events_to_drop);
+                        
+                        break;
+                    }
+                    Err(e) => {
+                        // Error during drain
+                        println!("ProcessOutput during drain failed: {:?}", e);
+                        let sample_to_drop = ManuallyDrop::take(&mut output_buffers[0].pSample);
+                        drop(sample_to_drop);
+                        
+                        let events_to_drop = ManuallyDrop::take(&mut output_buffers[0].pEvents);
+                        drop(events_to_drop);
+                        
+                        // We still return any samples we got before the error
+                        break;
+                    }
+                }
+            }
         }
-        Ok(())
+        
+        Ok(result_samples)
     }
-
-    fn wait_for_completion(&mut self) -> Result<()> {
-        let handle = self.encoder_thread_handle.take().unwrap();
-        handle.join().unwrap()
-    }
-
-    // Update callback signatures to use Audio types
-    pub fn set_sample_requested_callback<
-        F: 'static + Send + FnMut() -> Result<Option<AudioEncoderInputSample>>,
-    >(
-        &mut self,
-        callback: F,
-    ) {
-        self.inner.as_mut().unwrap().sample_requested_callback = Some(Box::new(callback));
-    }
-
-    pub fn set_sample_rendered_callback<
-        F: 'static + Send + FnMut(AudioEncoderOutputSample) -> Result<()>,
-    >(
-        &mut self,
-        callback: F,
-    ) {
-        self.inner.as_mut().unwrap().sample_rendered_callback = Some(Box::new(callback));
-    }
-
-    // Accessor for the configured output media type
-    pub fn output_type(&self) -> &IMFMediaType {
-        &self.output_type
+    
+    // Provide access to the configured output media type
+    pub fn output_media_type(&self) -> &IMFMediaType {
+        &self.output_media_type
     }
 }
 
-// Mark inner struct as Send (assuming IMFTransform and other COM objects are thread-safe
-// when used correctly - which MF generally allows for MFTs following standard patterns)
-unsafe impl Send for AudioEncoderInner {}
-
-// Rename constants for clarity if desired, or keep using MF ones
-const AUDIO_ENGINE_TRANFORM_NEED_INPUT: MF_EVENT_TYPE = METransformNeedInput;
-const AUDIO_ENGINE_TRANFORM_HAVE_OUTPUT: MF_EVENT_TYPE = METransformHaveOutput;
-
-impl AudioEncoderInner {
-    // The core encoding loop run by the dedicated thread
-    fn encode(&mut self) -> Result<()> {
-        unsafe {
-            self.transform
-                .ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
-            self.transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)?;
-            self.transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)?;
-
-                let mut should_exit = false;
-                while !should_exit {
-                    let event = self
-                        .event_generator
-                        .GetEvent(MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0))?;
+// Helper function to create an IMFMediaType for uncompressed audio input
+fn create_audio_media_type(format: &AudioFormat) -> Result<IMFMediaType> {
+    unsafe {
+        let media_type = MFCreateMediaType()?;
         
-                    let event_type = MF_EVENT_TYPE(event.GetType()? as i32);
-                    match event_type {
-                        AUDIO_ENGINE_TRANFORM_NEED_INPUT => {
-                            should_exit = self.on_transform_input_requested()?;
-                        }
-                        AUDIO_ENGINE_TRANFORM_HAVE_OUTPUT => {
-                            self.on_transform_output_ready()?;
-                        }
-                    _ => {
-                        panic!("Unknown media event type: {}", event_type.0);
-                    }
+        media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        media_type.SetGUID(&MF_MT_SUBTYPE, &format.format)?;
+        media_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, format.sample_rate)?;
+        media_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, format.channels as u32)?;
+        media_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, format.bits_per_sample as u32)?;
+        media_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, format.block_align() as u32)?;
+        media_type.SetUINT32(
+            &MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
+            format.avg_bytes_per_second(),
+        )?;
+        
+        // Set interlace mode to progressive (standard for audio)
+        media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        
+        // Required for some transforms/sinks, especially multichannel
+        const SPEAKER_FRONT_LEFT: u32 = 0x1;
+        const SPEAKER_FRONT_RIGHT: u32 = 0x2;
+        const SPEAKER_FRONT_CENTER: u32 = 0x4;
+        
+        let mut mask_to_set: Option<u32> = format.channel_mask;
+        
+        if mask_to_set.is_none() {
+            // Provide default masks for mono/stereo if not specified
+            match format.channels {
+                1 => mask_to_set = Some(SPEAKER_FRONT_CENTER), // Standard mono
+                2 => mask_to_set = Some(SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT), // Standard stereo
+                _ => {
+                    println!("Warning: Creating audio media type for {} channels without an explicit channel mask.", format.channels);
                 }
-            }
-
-            self.transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0)?;
-            self.transform
-                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0)?;
-            self.transform
-                .ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0)?;
+            };
         }
-        Ok(())
-    }
-
-    fn on_transform_input_requested(&mut self) -> Result<bool> {
-        let mut should_exit = true;
-        if !self.should_stop.load(Ordering::SeqCst) {
-            if let Some(sample) = self.sample_requested_callback.as_mut().unwrap()()? {
-                unsafe {
-                    self.transform
-                        .ProcessInput(self.input_stream_id, sample.sample(), 0)?;
-                }
-                should_exit = false;
+        
+        if let Some(mask) = mask_to_set {
+            if mask != 0 {
+                media_type.SetUINT32(&MF_MT_AUDIO_CHANNEL_MASK, mask)?;
+            } else if format.channels > 0 {
+                println!("Warning: Audio channel mask is 0 for {} channels. This might be invalid.", format.channels);
             }
         }
-        Ok(should_exit)
+        
+        Ok(media_type)
     }
+}
 
-    // Called when the MFT signals METransformHaveOutput
-    fn on_transform_output_ready(&mut self) -> Result<()> {
-        let mut status = 0;
-        let output_buffer = MFT_OUTPUT_DATA_BUFFER {
-            dwStreamID: self.output_stream_id,
-            ..Default::default()
-        };
-
-        let sample = unsafe {
-            let mut output_buffers = [output_buffer];
-            self.transform
-                .ProcessOutput(0, &mut output_buffers, &mut status)?;
-            output_buffers[0].pSample.as_ref().unwrap().clone()
-        };
-
-        let output_sample = AudioEncoderOutputSample { sample };
-        self.sample_rendered_callback.as_mut().unwrap()(output_sample)?;
-        Ok(())
+fn create_aac_output_media_type(
+    format: &AudioFormat, 
+    bitrate: Option<u32>
+) -> Result<IMFMediaType> {
+    unsafe {
+        let media_type = MFCreateMediaType()?;
+        
+        // Set major type to Audio
+        media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        
+        // Set subtype to AAC
+        media_type.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC)?;
+        
+        // Set basic audio properties
+        media_type.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, format.sample_rate)?;
+        media_type.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, format.channels as u32)?;
+        
+        // AAC usually supports 16-bit samples, set this explicitly
+        media_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        
+        // Calculate and set bitrate
+        let bitrate_value = bitrate.unwrap_or_else(|| {
+            // Default bitrates based on sample rate and channels if not specified
+            // These are reasonable defaults for AAC
+            match (format.sample_rate, format.channels) {
+                (sr, ch) if sr >= 48000 && ch >= 2 => 192000, // High quality stereo
+                (sr, ch) if sr >= 44100 && ch >= 2 => 128000, // CD quality stereo
+                (sr, ch) if sr >= 44100 && ch == 1 => 96000,  // CD quality mono
+                (sr, _) if sr >= 32000 => 80000,              // Medium quality
+                (sr, _) if sr >= 24000 => 64000,              // Lower quality
+                (sr, _) if sr >= 16000 => 48000,              // Voice quality
+                _ => 32000,                                   // Minimum quality
+            }
+        });
+        
+        // Set bitrate (bytes per second = bits per second / 8)
+        media_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bitrate_value / 8)?;
+        
+        // Set block alignment (not always required for AAC, but good practice)
+        let block_align = format.block_align() as u32;
+        if block_align > 0 {
+            media_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, block_align)?;
+        }
+        
+        // Set AAC-specific attributes
+        
+        // AAC Payload Type: 0 = Raw AAC
+        // Other options include: 1 = ADTS, 2 = ADIF, 3 = LOAS
+        media_type.SetUINT32(&MF_MT_AAC_PAYLOAD_TYPE, 0)?;
+        
+        // AAC Profile: 0x29 = AAC Low Complexity (LC) profile
+        // Other common profiles: 0x2B = HE-AAC, 0x2C = HE-AACv2
+        media_type.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29)?;
+        
+        // For channel masks (important for multi-channel audio)
+        if let Some(mask) = format.channel_mask {
+            if mask != 0 {
+                media_type.SetUINT32(&MF_MT_AUDIO_CHANNEL_MASK, mask)?;
+            }
+        } else if format.channels > 2 {
+            // For more than stereo, a channel mask is strongly recommended
+            // But we just log a warning and continue
+            println!("Warning: No channel mask specified for multi-channel AAC audio");
+        }
+        
+        // Set interlace mode to progressive (standard for audio)
+        media_type.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        
+        Ok(media_type)
     }
 }

@@ -15,6 +15,8 @@ use windows::{
 // and are generic enough to work with different MFT categories and attributes.
 use crate::media::{enumerate_mfts, get_string_attribute};
 
+unsafe impl Send for AudioEncoderDevice {}
+unsafe impl Sync for AudioEncoderDevice {}
 #[derive(Clone)]
 pub struct AudioEncoderDevice {
     source: IMFActivate,
