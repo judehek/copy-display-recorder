@@ -345,19 +345,7 @@ impl VideoEncoderInner {
                     let event_type = MF_EVENT_TYPE(event.GetType()? as i32);
                     match event_type {
                         MEDIA_ENGINE_TRANFORM_NEED_INPUT => {
-                            // Add wall clock timestamp right when encoder requests input
-                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-                            /*println!("[ENCODER] Need input event at {:?}.{:03}s", 
-                                   now.as_secs(), 
-                                   now.subsec_millis());*/
-                            
                             should_exit = self.on_transform_input_requested()?;
-                            
-                            // Optionally log after processing the input request
-                            let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-                            /*println!("[ENCODER] Finished processing input at {:?}.{:03}s", 
-                                   after.as_secs(), 
-                                   after.subsec_millis());*/
                         }
                         MEDIA_ENGINE_TRANFORM_HAVE_OUTPUT => {
                             self.on_transform_output_ready()?;

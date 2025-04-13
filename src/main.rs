@@ -1,5 +1,4 @@
 mod args;
-mod capture;
 mod d3d;
 mod displays;
 mod hotkey;
@@ -16,6 +15,7 @@ use std::sync::atomic::{AtomicBool};
 use std::{path::Path, time::Duration};
 
 use args::Args;
+use audio::encoder_device::AudioEncoderDevice;
 use old_audio::AudioSource;
 use clap::Parser;
 use d3d::set_multithread_protected;
@@ -89,17 +89,15 @@ fn run(
         );
     }
 
-    // Get the display handle using the provided index
+    // TODO: get display handle by window (game) rather than index
     let display_handle = get_display_handle_from_index(display_index)
         .expect("The provided display index was out of bounds!");
-    // Create D3D device early as it's needed for duplication setup
+
     let d3d_device = create_d3d_device()?;
 
     let _ = set_multithread_protected(&d3d_device, true)?;
 
-    // Resolve encoding settings (Need a way to get default resolution without GraphicsCaptureItem)
-    // For now, let's require the user to specify it if not default.
-    // TODO: Get monitor resolution directly using DXGI or GDI if resolution is default.
+    // TODO: move this stuff to a method and automatically get resolution
     let resolution = resolution
         .get_size()
         .expect("Resolution must be specified when not using Graphics Capture.");
@@ -146,9 +144,6 @@ fn run(
 
     let is_recording_window = Arc::new(AtomicBool::new(true));
     let hook = window_detector::start_window_change_detector(is_recording_window.clone());
-
-    // setup audio capture
-    //TODO: 
 
     // Start the recording
     {
@@ -242,14 +237,33 @@ fn pause() {
 }
 
 fn enum_encoders() -> Result<()> {
-    let encoder_devices = VideoEncoderDevice::enumerate()?;
-    if encoder_devices.is_empty() {
-        exit_with_error("No hardware H264 encoders found!");
+    // Enumerate video encoders
+    let video_encoder_devices = VideoEncoderDevice::enumerate()?;
+    if video_encoder_devices.is_empty() {
+        println!("No hardware H264 encoders found!");
+    } else {
+        println!("Video Encoders ({}):", video_encoder_devices.len());
+        for (i, encoder_device) in video_encoder_devices.iter().enumerate() {
+            println!("  {} - {}", i, encoder_device.display_name());
+        }
     }
-    println!("Encoders ({}):", encoder_devices.len());
-    for (i, encoder_device) in encoder_devices.iter().enumerate() {
-        println!("  {} - {}", i, encoder_device.display_name());
+    
+    // Enumerate audio encoders
+    let audio_encoder_devices = AudioEncoderDevice::enumerate()?;
+    if audio_encoder_devices.is_empty() {
+        println!("No hardware AAC audio encoders found!");
+    } else {
+        println!("Audio Encoders ({}):", audio_encoder_devices.len());
+        for (i, encoder_device) in audio_encoder_devices.iter().enumerate() {
+            println!("  {} - {}", i, encoder_device.display_name());
+        }
     }
+    
+    // If both types of encoders are missing, exit with an error
+    if video_encoder_devices.is_empty() && audio_encoder_devices.is_empty() {
+        exit_with_error("No hardware encoders found!");
+    }
+    
     Ok(())
 }
 

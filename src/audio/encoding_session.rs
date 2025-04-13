@@ -1,246 +1,334 @@
-// use std::sync::{Arc, mpsc::{self, Receiver, Sender}};
-// use std::thread;
-// use std::time::Duration;
+use std::{sync::Arc, time::{SystemTime, UNIX_EPOCH}};
 
-// use windows::{
-//     core::Result,
-//     Storage::Streams::IRandomAccessStream,
-//     Win32::Media::MediaFoundation::{IMFSample, IMFSinkWriter},
-// };
+use windows::{
+    core::{Result, HSTRING},
+    Foundation::TimeSpan,
+    Graphics::SizeInt32,
+    Storage::Streams::IRandomAccessStream,
+    Win32::{
+        Graphics::{
+            Direct3D11::{
+                ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D, 
+                D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, 
+                D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT
+            },
+            Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC},
+            Gdi::HMONITOR,
+        },
+        Media::MediaFoundation::{
+            IMFMediaType, IMFSample, IMFSinkWriter, MFCreateAttributes, 
+            MFCreateMFByteStreamOnStreamEx, MFCreateSinkWriterFromURL
+        },
+        System::Performance::QueryPerformanceFrequency
+    },
+};
 
-// use ringbuf::{consumer::Consumer as RingConsumer, storage::Heap, wrap::caching::Caching, SharedRb};
+use crate::audio::capture::{AcquiredFrame, CaptureAudioGenerator};
 
-// use crate::audio::encoder::{AudioEncoder, AudioEncoderInputSample};
+use super::{
+    encoder::{AudioEncoder, AudioEncoderInputSample},
+    encoder_device::{AudioEncoderDevice, VideoEncoderDevice},
+    processor::{AudioFormat, AudioProcessor, VideoProcessor},
+};
 
-// type ConsumerType = Caching<Arc<SharedRb<Heap<f32>>>, false, true>;
+pub struct AudioEncodingSession {
+    video_encoder: AudioEncoder,
+    capture_session: CustomGraphicsCaptureSession,
+    sample_writer: Arc<SampleWriter>,
+}
 
-// pub struct AudioEncodingSession {
-//     encoder: AudioEncoder,
-//     audio_consumer: ConsumerType,
-//     sample_writer: Arc<AudioSampleWriter>,
-//     stop_flag: Arc<std::sync::atomic::AtomicBool>,
-//     buffer_thread_handle: Option<thread::JoinHandle<()>>,
-// }
+struct SampleGenerator {
+    audio_processor: Option<AudioProcessor>,
+    microphone_processor: Option<AudioProcessor>,
 
-// // Writer to handle sending audio samples to the sink
-// struct AudioSampleWriter {
-//     sink_writer: IMFSinkWriter,
-//     stream_index: u32,
-// }
+    audio_generator: Option<CaptureAudioGenerator>,
+    microphone_generator: Option<CaptureAudioGenerator>,
+}
 
-// impl AudioEncodingSession {
-//     pub fn new(
-//         stream: IRandomAccessStream,
-//         audio_consumer: Box<dyn RingConsumer<Item = f32> + Send>,
-//         sample_rate: u32,
-//         channels: u32,
-//         bit_rate: u32,
-//     ) -> Result<Self> {
-//         // Create the encoder
-//         let mut encoder = AudioEncoder::new(sample_rate, channels, bit_rate)?;
-        
-//         // Get output type for the sink writer
-//         let output_type = encoder.output_type().clone();
-        
-//         // Create sample writer
-//         let sample_writer = Arc::new(AudioSampleWriter::new(stream, &output_type)?);
-        
-//         // Create shared stop flag
-//         let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        
-//         // Set up callbacks
-//         let (tx, rx) = mpsc::channel();
-//         let sample_writer_clone = sample_writer.clone();
-//         encoder.set_sample_rendered_callback(move |output_sample| {
-//             sample_writer_clone.write(output_sample.sample())
-//         });
+pub struct SampleWriter {
+    _stream: IRandomAccessStream,
+    sink_writer: IMFSinkWriter,
+    sink_writer_stream_index: u32,
+}
 
-//         // We'll set up the sample_requested_callback in start() when we spin up 
-//         // the buffer thread
-        
-//         Ok(Self {
-//             encoder,
-//             audio_consumer: Some(audio_consumer),
-//             sample_writer,
-//             stop_flag,
-//             buffer_thread_handle: None,
-//         })
-//     }
-    
-//     pub fn start(&mut self) -> Result<()> {
-//         // Flag that we're running
-//         self.stop_flag.store(false, std::sync::atomic::Ordering::SeqCst);
-        
-//         // Set up the buffer thread
-//         let mut audio_consumer = self.audio_consumer.take()
-//             .expect("Audio consumer missing, has the session already been started?");
-        
-//         let stop_flag = self.stop_flag.clone();
-        
-//         // Create a channel to send processed audio samples to the encoder
-//         let (audio_tx, audio_rx) = mpsc::channel();
-        
-//         // Start buffer thread to read from ring buffer and prepare samples
-//         self.buffer_thread_handle = Some(thread::spawn(move || {
-//             let mut buffer: Vec<f32> = Vec::with_capacity(1024);
-//             let mut next_timestamp = 0i64;
-            
-//             while !stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
-//                 // Try to read up to 1024 samples
-//                 while buffer.len() < 1024 {
-//                     match audio_consumer.pop() {
-//                         Some(sample) => buffer.push(sample),
-//                         None => break,  // No more samples available right now
-//                     }
-//                 }
+impl AudioEncodingSession {
+    pub fn new(
+        encoder_device: &AudioEncoderDevice,
+        bit_rate: u32,
+        frame_rate: u32,
+        stream: IRandomAccessStream,
+    ) -> Result<Self> {
+        let mut audio_encoder = AudioEncoder::new(
+            encoder_device,
+            d3d_device.clone(),
+            output_size,
+            output_size,
+            bit_rate,
+            frame_rate,
+        )?;
+        let output_type = audio_encoder.output_type().clone();
+
+        let mut sample_generator = SampleGenerator::new(
+            d3d_device, 
+            monitor_handle,
+            input_size, 
+            output_size,
+            frame_rate,
+        )?;
+        let capture_session = sample_generator.capture_session().clone();
+        audio_encoder.set_sample_requested_callback(
+            move || -> Result<Option<AudioEncoderInputSample>> { sample_generator.generate() },
+        );
+
+        let sample_writer = Arc::new(SampleWriter::new(stream, &output_type)?);
+        audio_encoder.set_sample_rendered_callback({
+            let sample_writer = sample_writer.clone();
+            move |sample| -> Result<()> { sample_writer.write(sample.sample()) }
+        });
+
+        Ok(Self {
+            audio_encoder,
+            capture_session,
+            sample_writer,
+        })
+    }
+
+    pub fn start(&mut self) -> Result<()> {
+        self.sample_writer.start()?;
+        self.capture_session.StartCapture()?;
+        assert!(self.video_encoder.try_start()?);
+        Ok(())
+    }
+
+    pub fn stop(&mut self) -> Result<()> {
+        self.video_encoder.stop()?;
+        self.sample_writer.stop()?;
+        Ok(())
+    }
+}
+
+unsafe impl Send for SampleGenerator {}
+impl SampleGenerator {
+    pub fn new(
+        capture_audio: bool,
+        capture_microphone: bool,
+        audio_input_format: AudioFormat,
+        microphone_input_format: AudioFormat,
+        output_format: AudioFormat,
+        quality: Option<u32>,
+    ) -> Result<Self> {
+        if capture_audio {
+            let audio_processor = AudioProcessor::new(
+                audio_input_format,
+                output_format,
+                quality,
+            )?;
+        }
+
+        if capture_microphone {
+            let microphone_processor = AudioProcessor::new(
+                audio_input_format,
+                output_format,
+                quality,
+            )?;
+        }
+
+        // Create frame generator
+        let audio_generator = CaptureAudioGenerator::new(d3d_device.clone(), monitor_handle)?;
+
+        Ok(Self {
+            d3d_device,
+            d3d_context,
+
+            video_processor,
+            compose_texture,
+            render_target_view,
+
+            audio_generator,
+        })
+    }
+
+    pub fn capture_session(&self) -> &CustomGraphicsCaptureSession {
+        self.audio_generator.session()
+    }
+
+    pub fn generate(&mut self) -> Result<Option<AudioEncoderInputSample>> {
+        while let Some(frame) = self.frame_generator.try_get_next_frame()? {
+            // Initialize timing on first frame
+            if !self.seen_first_time_stamp {
+                self.first_timestamp = frame.present_time;
+                self.seen_first_time_stamp = true;
+                self.next_frame_time = TimeSpan {
+                    Duration: self.first_timestamp.Duration + self.frame_period,
+                };
                 
-//                 // If we got any samples, create an input sample and send it
-//                 if !buffer.is_empty() {
-//                     // Convert f32 samples to i16 PCM
-//                     let pcm_data = convert_f32_to_i16_pcm(&buffer);
-                    
-//                     // Calculate duration in 100ns units
-//                     // 10_000_000 (100ns in a second) / sample_rate = 100ns per sample
-//                     let samples_per_channel = buffer.len() / 2; // Assuming stereo
-//                     let duration = 10_000_000 * samples_per_channel as i64 / 48000; // Assuming 48kHz
-                    
-//                     // Create and send the input sample
-//                     let input_sample = AudioEncoderInputSample::new(
-//                         pcm_data,
-//                         next_timestamp,
-//                         duration,
-//                     );
-                    
-//                     // Update next timestamp
-//                     next_timestamp += duration;
-                    
-//                     // Send the sample
-//                     if audio_tx.send(input_sample).is_err() {
-//                         // Encoder has been dropped, exit thread
-//                         break;
-//                     }
-                    
-//                     // Clear the buffer for next batch
-//                     buffer.clear();
-//                 } else {
-//                     // No samples available, wait a bit
-//                     thread::sleep(Duration::from_millis(5));
-//                 }
-//             }
-//         }));
-        
-//         // Set up the encoder's sample requested callback to pull from our channel
-//         self.encoder.set_sample_requested_callback(move || -> Result<Option<AudioEncoderInputSample>> {
-//             match audio_rx.recv_timeout(Duration::from_millis(100)) {
-//                 Ok(sample) => Ok(Some(sample)),
-//                 Err(mpsc::RecvTimeoutError::Timeout) => {
-//                     // No sample available yet, but we're still running
-//                     // Return empty sample to keep encoder running
-//                     Ok(Some(AudioEncoderInputSample::new(
-//                         Vec::new(),  // Empty data (silence)
-//                         next_timestamp,
-//                         10_000_000 / 100, // 10ms of silence
-//                     )))
-//                 },
-//                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-//                     // Buffer thread has exited
-//                     Ok(None)
-//                 }
-//             }
-//         });
-        
-//         // Start the encoder
-//         self.encoder.try_start()?;
-        
-//         Ok(())
-//     }
-    
-//     pub fn stop(&mut self) -> Result<()> {
-//         // Signal threads to stop
-//         self.stop_flag.store(true, std::sync::atomic::Ordering::SeqCst);
-        
-//         // Stop the encoder
-//         self.encoder.stop()?;
-        
-//         // Wait for buffer thread to finish
-//         if let Some(handle) = self.buffer_thread_handle.take() {
-//             let _ = handle.join();
-//         }
-        
-//         Ok(())
-//     }
-// }
+                return self.generate_from_frame(&frame).map(Some);
+            }
+            
+            // Calculate timing relative to first frame
+            let relative_time = frame.present_time.Duration - self.first_timestamp.Duration;
+            let expected_time = self.next_frame_time.Duration - self.first_timestamp.Duration;
+            
+            // Check if this frame meets our timing requirements
+            if relative_time >= expected_time {
 
-// impl AudioSampleWriter {
-//     pub fn new(
-//         stream: IRandomAccessStream,
-//         output_type: &windows::Win32::Media::MediaFoundation::IMFMediaType,
-//     ) -> Result<Self> {
-//         // Create attributes
-//         unsafe {
-//             let attributes = windows::Win32::Media::MediaFoundation::MFCreateAttributes(None, 0)?;
+                // Update next expected frame time
+                self.next_frame_time.Duration += self.frame_period;
+                
+                return self.generate_from_frame(&frame).map(Some);
+            }
             
-//             // Create byte stream from random access stream
-//             let byte_stream = windows::Win32::Media::MediaFoundation::MFCreateMFByteStreamOnStreamEx(&stream)?;
-            
-//             // Create sink writer
-//             let sink_writer = windows::Win32::Media::MediaFoundation::MFCreateSinkWriterFromURL(
-//                 &windows::core::HSTRING::from(".mp4"),
-//                 &byte_stream,
-//                 &attributes,
-//             )?;
-            
-//             // Add stream for AAC audio
-//             let stream_index = sink_writer.AddStream(output_type)?;
-            
-//             // Set input media type (same as output for audio)
-//             sink_writer.SetInputMediaType(
-//                 stream_index,
-//                 output_type,
-//                 &attributes,
-//             )?;
-            
-//             // Begin writing
-//             sink_writer.BeginWriting()?;
-            
-//             Ok(Self {
-//                 sink_writer,
-//                 stream_index,
-//             })
-//         }
-//     }
-    
-//     pub fn write(&self, sample: &IMFSample) -> Result<()> {
-//         unsafe {
-//             self.sink_writer.WriteSample(self.stream_index, sample)
-//         }
-//     }
-    
-//     pub fn finalize(&self) -> Result<()> {
-//         unsafe {
-//             self.sink_writer.Finalize()
-//         }
-//     }
-// }
-
-// impl Drop for AudioSampleWriter {
-//     fn drop(&mut self) {
-//         let _ = self.finalize();
-//     }
-// }
-
-// // Helper function to convert f32 audio samples to i16 PCM
-// fn convert_f32_to_i16_pcm(samples: &[f32]) -> Vec<u8> {
-//     let mut pcm_data = Vec::with_capacity(samples.len() * 2); // 2 bytes per sample
-    
-//     for &sample in samples {
-//         // Clamp to [-1.0, 1.0] and convert to i16 range
-//         let scaled = (sample.max(-1.0).min(1.0) * 32767.0) as i16;
+            // Frame is too early, skip it and continue loop
+        }
         
-//         // Add as little-endian bytes
-//         pcm_data.push((scaled & 0xFF) as u8);        // Low byte
-//         pcm_data.push(((scaled >> 8) & 0xFF) as u8); // High byte
-//     }
+        // No more frames, end capture
+        self.stop_capture()?;
+        Ok(None)
+    }
+
+    fn stop_capture(&mut self) -> Result<()> {
+        self.frame_generator.stop_capture()
+    }
     
-//     pcm_data
-// }
+    fn generate_from_frame(
+        &mut self,
+        frame: &AcquiredFrame,
+    ) -> Result<VideoEncoderInputSample> {
+        let frame_texture = &frame.texture;
+        let frame_time = frame.present_time;
+
+        if !self.seen_first_time_stamp {
+            self.first_timestamp = frame_time;
+            self.seen_first_time_stamp = true;
+        }
+
+        let timestamp = TimeSpan {
+            Duration: frame_time.Duration - self.first_timestamp.Duration,
+        };
+    
+        // Determine region to copy
+        let desc = unsafe {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            frame_texture.GetDesc(&mut desc);
+            desc
+        };
+        let region = D3D11_BOX {
+            left: 0, right: desc.Width, top: 0, bottom: desc.Height, back: 1, front: 0,
+        };
+    
+        // GPU Processing
+        unsafe {
+            // Clear render target
+            self.d3d_context.ClearRenderTargetView(&self.render_target_view, &CLEAR_COLOR);
+    
+            // Copy the captured frame to composition texture
+            self.d3d_context.CopySubresourceRegion(
+                &self.compose_texture,
+                0, 0, 0, 0,
+                frame_texture,
+                0, Some(&region),
+            );
+    
+            // Process BGRA -> NV12
+            // Fix: Call the function directly and use ? afterward
+            self.video_processor.process_texture(&self.compose_texture)?;
+    
+            // Get the resulting NV12 texture
+            let video_output_texture = self.video_processor.output_texture();
+    
+            // Create a new texture for the sample
+            let sample_texture = {
+                 let output_desc = {
+                     let mut desc = D3D11_TEXTURE2D_DESC::default();
+                     video_output_texture.GetDesc(&mut desc);
+                     desc
+                 };
+                 
+                 // Fix: Call the function directly and use ? afterward
+                 let mut texture = None;
+                 self.d3d_device.CreateTexture2D(&output_desc, None, Some(&mut texture))?;
+                 texture.unwrap()
+            };
+            
+            // Copy the processed texture to the sample texture
+            self.d3d_context.CopyResource(&sample_texture, video_output_texture);
+    
+            // Create and return the input sample
+            Ok(VideoEncoderInputSample::new(
+                timestamp,
+                sample_texture,
+            ))
+        }
+    }
+}
+
+unsafe impl Send for SampleWriter {}
+unsafe impl Sync for SampleWriter {}
+impl SampleWriter {
+    pub fn new(
+        stream: IRandomAccessStream,
+        output_type: &IMFMediaType,
+    ) -> Result<Self> {
+        let empty_attributes = unsafe {
+            let mut attributes = None;
+            MFCreateAttributes(&mut attributes, 0)?;
+            attributes.unwrap()
+        };
+        let sink_writer = unsafe {
+            let byte_stream = MFCreateMFByteStreamOnStreamEx(&stream)?;
+            MFCreateSinkWriterFromURL(&HSTRING::from(".mp4"), &byte_stream, &empty_attributes)?
+        };
+        let sink_writer_stream_index = unsafe { sink_writer.AddStream(output_type)? };
+        unsafe {
+            sink_writer.SetInputMediaType(
+                sink_writer_stream_index,
+                output_type,
+                &empty_attributes,
+            )?
+        };
+
+        Ok(Self {
+            _stream: stream,
+            sink_writer,
+            sink_writer_stream_index,
+        })
+    }
+
+    pub fn start(&self) -> Result<()> {
+        unsafe { self.sink_writer.BeginWriting() }
+    }
+
+    pub fn stop(&self) -> Result<()> {
+        unsafe { self.sink_writer.Finalize() }
+    }
+
+    pub fn write(&self, sample: &IMFSample) -> Result<()> {
+        // Get the sample time directly
+        unsafe {
+            //let time = sample.GetSampleTime()?;
+            //println!("Sample time: {}", time);
+            
+            // Write the sample to the sink
+            self.sink_writer
+                .WriteSample(self.sink_writer_stream_index, sample)
+        }
+    }
+}
+
+
+const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+fn ensure_even(value: i32) -> i32 {
+    if value % 2 == 0 {
+        value
+    } else {
+        value + 1
+    }
+}
+
+fn ensure_even_size(size: SizeInt32) -> SizeInt32 {
+    SizeInt32 {
+        Width: ensure_even(size.Width),
+        Height: ensure_even(size.Height),
+    }
+}

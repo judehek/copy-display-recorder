@@ -19,11 +19,11 @@ use windows::{
             IMFMediaType, IMFSample, IMFSinkWriter, MFCreateAttributes, 
             MFCreateMFByteStreamOnStreamEx, MFCreateSinkWriterFromURL
         },
-        System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency}
+        System::Performance::QueryPerformanceFrequency
     },
 };
 
-use crate::capture::{AcquiredFrame, CaptureFrameGenerator, CustomGraphicsCaptureSession};
+use crate::video::capture::{AcquiredFrame, CaptureFrameGenerator, CustomGraphicsCaptureSession};
 
 use super::{
     encoder::{VideoEncoder, VideoEncoderInputSample},
@@ -52,7 +52,6 @@ struct SampleGenerator {
 
     frame_period: i64,
     next_frame_time: TimeSpan,
-    qpc_frequency: i64,
 }
 
 pub struct SampleWriter {
@@ -195,7 +194,6 @@ impl SampleGenerator {
 
             frame_period,
             next_frame_time: TimeSpan::default(),
-            qpc_frequency,
         })
     }
 

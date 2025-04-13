@@ -54,6 +54,8 @@ features = [
     "Win32_Media_Multimedia",
     "Win32_Security",
     "Win32_UI_Accessibility",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_Ole",
 ]
 
 [features]
