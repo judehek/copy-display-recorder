@@ -21,6 +21,7 @@ fn should_record_window() -> bool {
 
 pub fn start_window_change_detector(is_recording_window: Arc<AtomicBool>) -> HWINEVENTHOOK {
 
+    // TODO: memory leak?
     unsafe {
         let leaked = Box::leak(Box::new(is_recording_window));
         RECORDING_FLAG = Some(leaked);
@@ -60,8 +61,7 @@ pub fn start_window_change_detector(is_recording_window: Arc<AtomicBool>) -> HWI
         }
     }
 
-    // Set up the event hook
-    // TODO: make sure this isnt a resource leak, too lazy to check rn
+    // TODO: resource leak? I think we need to unhook on recording stop()
     unsafe {
         SetWinEventHook(
             EVENT_SYSTEM_FOREGROUND,

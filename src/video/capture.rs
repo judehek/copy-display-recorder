@@ -351,19 +351,37 @@ impl CaptureFrameGenerator {
 
     // Simplified function that just receives from the channel
     pub fn try_get_next_frame(&mut self) -> Result<Option<AcquiredFrame>> {
-        match self.receiver.recv() {
-            Ok(Some(frame)) => {
-                Ok(Some(frame))
-            },
-            Ok(None) => {
-                // End of capture signal
-                Ok(None)
-            },
-            Err(_) => {
-                // Channel closed, end of capture
-                Ok(None)
+        // First wait for at least one frame (or end signal)
+        let mut latest_frame = match self.receiver.recv() {
+            Ok(Some(frame)) => Some(frame),
+            Ok(None) => return Ok(None), // End of capture signal
+            Err(_) => return Ok(None),   // Channel closed
+        };
+        
+        // Now drain any additional frames that arrived
+        loop {
+            match self.receiver.try_recv() {
+                Ok(Some(frame)) => {
+                    // Keep updating with newer frames
+                    latest_frame = Some(frame);
+                },
+                Ok(None) => {
+                    // End of capture signal - return None regardless of what we've seen before
+                    return Ok(None);
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // No more frames in the channel, break the loop
+                    break;
+                },
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // Channel closed, end of capture
+                    return Ok(None);
+                }
             }
         }
+        
+        // Return the latest frame we found
+        Ok(latest_frame)
     }
 
     pub fn stop_capture(&mut self) -> Result<()> {
