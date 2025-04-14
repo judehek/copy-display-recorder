@@ -11,7 +11,7 @@ pub fn get_display_handle_from_index(index: usize) -> Option<HMONITOR> {
 fn enumerate_displays() -> Vec<HMONITOR> {
     unsafe {
         let displays = Box::into_raw(Box::default());
-        EnumDisplayMonitors(HDC(0), None, Some(enum_monitor), LPARAM(displays as isize));
+        EnumDisplayMonitors(None, None, Some(enum_monitor), LPARAM(displays as isize));
         *Box::from_raw(displays)
     }
 }

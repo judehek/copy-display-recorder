@@ -11,9 +11,8 @@ clap = { version = "4.4.3", features = ["derive"] }
 ringbuf = "0.4.8"
 
 [dependencies.windows]
-version = "0.51.1"
+version = "0.61.1"
 features = [
-    "implement",
     "Foundation",
     "Foundation_Metadata",
     "Foundation_Numerics",
@@ -56,6 +55,7 @@ features = [
     "Win32_UI_Accessibility",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Ole",
+    "Storage_Search",
 ]
 
 [features]

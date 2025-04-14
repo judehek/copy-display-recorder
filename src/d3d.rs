@@ -1,4 +1,4 @@
-use windows::core::{ComInterface, Interface, Result};
+use windows::core::{Interface, Result};
 use windows::Graphics::DirectX::Direct3D11::{IDirect3DDevice, IDirect3DSurface};
 use windows::Win32::Graphics::Direct3D11::{ID3D11Multithread, ID3D11Texture2D, D3D11_CREATE_DEVICE_DEBUG};
 use windows::Win32::Graphics::Dxgi::IDXGISurface;
@@ -24,7 +24,7 @@ fn create_d3d_device_with_type(
         D3D11CreateDevice(
             None,
             driver_type,
-            None,
+            windows::Win32::Foundation::HMODULE(std::ptr::null_mut()),
             flags,
             None,
             D3D11_SDK_VERSION,
@@ -77,7 +77,7 @@ pub fn create_direct3d_surface(d3d_texture: &ID3D11Texture2D) -> Result<IDirect3
     inspectable.cast()
 }
 
-pub fn get_d3d_interface_from_object<S: Interface + ComInterface, R: Interface + ComInterface>(
+pub fn get_d3d_interface_from_object<S: Interface, R: Interface>(
     object: &S,
 ) -> Result<R> {
     let access: IDirect3DDxgiInterfaceAccess = object.cast()?;
