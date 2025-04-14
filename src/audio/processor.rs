@@ -1,7 +1,7 @@
 use windows::{
-    core::{implement, ComInterface, Interface, Result, GUID, HRESULT, PCWSTR},
+    core::{implement, Interface, Result, GUID, HRESULT, PCWSTR},
     Win32::{
-        Foundation::{CloseHandle, DECIMAL, HANDLE, S_OK},
+        Foundation::{CloseHandle, DECIMAL, HANDLE, S_OK, PROPERTYKEY},
         Media::MediaFoundation::{
             // Interfaces
             IMFActivate, IMFCollection, IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFAudioConstriction, MFAudioFormat_Float, MFAudioFormat_PCM, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Audio, MFShutdown, MFStartup, MFVideoInterlace_Progressive, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_CHANNEL_MASK, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_VERSION
@@ -19,7 +19,7 @@ use windows::{
             Variant::VT_UI4,
         },
         // Required for Property Store
-        UI::Shell::PropertiesSystem::{IPropertyStore, PROPERTYKEY},
+        UI::Shell::PropertiesSystem::IPropertyStore,
     },
 };
 
@@ -231,7 +231,7 @@ impl AudioProcessor {
                          // Ensure the MFT actually provided a sample
                          let processed_sample = filled_sample_option.ok_or_else(|| {
                             println!("Error: ProcessOutput succeeded but returned NULL sample pointer.");
-                            windows::core::Error::new(HRESULT(0x8000FFFFu32 as i32), "ProcessOutput succeeded but returned null sample".into()) // E_UNEXPECTED
+                            windows::core::Error::new(HRESULT(0x8000FFFFu32 as i32), "ProcessOutput succeeded but returned null sample") // E_UNEXPECTED
                          })?;
 
                          // Update buffer length (important!)

@@ -4,10 +4,11 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use windows::core::Error;
 use windows::Foundation::TimeSpan;
 use windows::Win32::System::Performance::QueryPerformanceCounter;
 use windows::{
-    core::{ComInterface, Result},
+    core::{Interface, Result},
     Win32::{
         Foundation::{E_FAIL, RECT},
         Graphics::{
@@ -35,16 +36,15 @@ fn get_dxgi_output_from_hmonitor(
         let output: IDXGIOutput = match unsafe { adapter.EnumOutputs(output_index) } {
             Ok(output) => output,
             Err(err) if err.code() == DXGI_ERROR_NOT_FOUND => {
-                return Err(windows::core::Error::new(
+                return Err(Error::new(
                     DXGI_ERROR_ACCESS_LOST,
-                    "Monitor not found on adapter".into(),
+                    "Monitor not found on adapter",
                 ));
             }
             Err(err) => return Err(err),
         };
 
-        let mut desc: DXGI_OUTPUT_DESC = Default::default();
-        unsafe { output.GetDesc(&mut desc)? };
+        let desc = unsafe { output.GetDesc()? };
         
         if desc.Monitor == monitor_handle {
             return output.cast();
@@ -132,9 +132,8 @@ impl CaptureFrameGenerator {
         let duplication = unsafe { output.DuplicateOutput(&d3d_device)? };
         
         // Get output dimensions
-        let mut desc: DXGI_OUTPUT_DESC = Default::default();
-        unsafe { output.GetDesc(&mut desc)? };
-        
+        // Get output dimensions
+        let desc = unsafe { output.GetDesc()? };
         // Clone necessary values for the capture thread
         let d3d_device_clone = d3d_device.clone();
         

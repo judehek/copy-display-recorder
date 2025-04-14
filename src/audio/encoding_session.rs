@@ -1,7 +1,7 @@
 use std::{sync::{Arc, Barrier, Mutex}, time::{SystemTime, UNIX_EPOCH}};
 
 use windows::{
-    core::{imp::CoTaskMemFree, ComInterface, Result, HSTRING},
+    core::{imp::CoTaskMemFree, Interface, Result, HSTRING},
     Foundation::TimeSpan,
     Graphics::SizeInt32,
     Storage::Streams::IRandomAccessStream,

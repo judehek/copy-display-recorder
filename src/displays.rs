@@ -1,7 +1,8 @@
 use windows::Win32::{
-    Foundation::{BOOL, LPARAM, RECT},
+    Foundation::{LPARAM, RECT},
     Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR},
 };
+use windows::core::BOOL;
 
 pub fn get_display_handle_from_index(index: usize) -> Option<HMONITOR> {
     let displays = enumerate_displays();

@@ -1,5 +1,5 @@
 use windows::{
-    core::{ComInterface, Result},
+    core::{Interface, Result},
     Win32::Media::MediaFoundation::{
         IMFActivate, IMFTransform, MFMediaType_Audio, // Changed from Video
         MFAudioFormat_AAC,                             // Changed from H264

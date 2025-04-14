@@ -220,11 +220,10 @@ impl CaptureMicrophoneGenerator {
         thread::spawn(move || {
             // Initialize COM in this thread
             unsafe {
-                if let Err(e) = CoInitializeEx(None, COINIT_APARTMENTTHREADED) {
+                if let Err(e) = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() {
                     eprintln!("COM init failed: {:?}", e);
                     return;
-                }
-                
+                }                
                 let mut running = false;
                 let mut audio_client: Option<IAudioClient> = None;
                 let mut audio_capture_client: Option<IAudioCaptureClient> = None;

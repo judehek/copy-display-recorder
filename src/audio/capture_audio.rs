@@ -225,7 +225,7 @@ impl CaptureAudioGenerator {
         thread::spawn(move || {
             // Initialize COM in this thread
             unsafe {
-                if let Err(e) = CoInitializeEx(None, COINIT_APARTMENTTHREADED) {
+                if let Err(e) = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() {
                     eprintln!("COM init failed: {:?}", e);
                     return;
                 }

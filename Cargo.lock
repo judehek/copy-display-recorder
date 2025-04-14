@@ -109,6 +109,7 @@ dependencies = [
  "clap",
  "ringbuf",
  "windows",
+ "windows-numerics",
 ]
 
 [[package]]
