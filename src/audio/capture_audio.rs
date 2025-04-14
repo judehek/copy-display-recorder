@@ -396,14 +396,11 @@ impl CaptureAudioGenerator {
     
     // Method to retrieve audio samples - now returns AudioSample structs
     pub fn try_get_audio_sample(&mut self) -> Option<AudioSample> {
-        println!("Consumer empty check: {}", self.consumer.is_empty());
         
         if !self.consumer.is_empty() {
             let result = self.consumer.try_pop();
-            println!("try_pop returned: {}", result.is_some());
             result
         } else {
-            println!("Consumer was empty, returning None");
             None
         }
     }

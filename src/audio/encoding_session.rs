@@ -137,17 +137,14 @@ impl AudioEncodingSession {
             
             while !stop_signal_thread.load(std::sync::atomic::Ordering::Relaxed) {
                 // Try to get the next sample
-                println!("loaded running thread");
                 if let Ok(mut generator) = sample_generator_thread.lock() {
-                    println!("calling generate");
                     match generator.generate() {
                         Ok(Some(sample)) => {
-                            println!("generated sample");
                             // Process the sample with the encoder (no mutex needed now)
                             match audio_encoder.process_sample(&sample) {
                                 Ok(Some(encoded_sample)) => {
                                     // Write the encoded sample
-                                    unsafe {println!("sample time: {:?}", encoded_sample.sample().GetSampleTime()); }
+                                    //unsafe {println!("sample time: {:?}", encoded_sample.sample().GetSampleTime()); }
                                     if let Err(e) = sample_writer.lock().unwrap().write_audio_sample(encoded_sample.sample()) {
                                         eprintln!("Error writing audio sample: {:?}", e);
                                     }
@@ -318,7 +315,6 @@ impl SampleGenerator {
         } else {
             None
         };
-        println!("got audio sample");
         
         /*let mic_sample = if let Some(generator) = &mut self.microphone_generator {
             generator.try_get_audio_sample()

@@ -3,7 +3,7 @@ use windows::{
         Foundation::S_OK,
         Media::MediaFoundation::{
             // Interfaces
-            IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFAudioFormat_AAC, MFAudioFormat_Float, MFAudioFormat_PCM, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Audio, MFVideoInterlace_Progressive, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, MF_MT_AAC_PAYLOAD_TYPE, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_CHANNEL_MASK, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE
+            IMFMediaBuffer, IMFMediaType, IMFSample, IMFTransform, MFAudioFormat_AAC, MFAudioFormat_Float, MFAudioFormat_PCM, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Audio, MFVideoInterlace_Progressive, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_INFO, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, MF_MT_AAC_PAYLOAD_TYPE, MF_MT_ALL_SAMPLES_INDEPENDENT, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_BLOCK_ALIGNMENT, MF_MT_AUDIO_CHANNEL_MASK, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE
         },
         System::{
             Com::StructuredStorage::PROPVARIANT,
@@ -39,7 +39,7 @@ impl AudioEncoderOutputSample {
 
 use std::mem::{ManuallyDrop};
 
-use crate::video::encoder;
+use crate::{media, video::encoder};
 
 use super::{encoder_device::AudioEncoderDevice, processor::AudioFormat};
 
@@ -160,7 +160,6 @@ impl AudioEncoder {
             // Try to create a buffer of the suggested size - encoders often need larger buffers
             let buffer_size = self.output_buffer_size;
             let output_buffer = MFCreateMemoryBuffer(buffer_size)?;
-            println!("output buffer");
             
             let output_sample = MFCreateSample()?;
             output_sample.AddBuffer(&output_buffer)?;
@@ -182,7 +181,6 @@ impl AudioEncoder {
                 &mut process_output_status, // Status flags
             ) {
                 Ok(_) => {
-                    println!("test");
                     // Success! We got an output sample.
                     let filled_sample_option = ManuallyDrop::take(&mut output_buffers[0].pSample);
                     
@@ -399,6 +397,8 @@ fn create_aac_output_media_type(
         
         // AAC usually supports 16-bit samples, set this explicitly
         media_type.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        
+        media_type.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
         
         // Calculate and set bitrate
         let bitrate_value = bitrate.unwrap_or_else(|| {
