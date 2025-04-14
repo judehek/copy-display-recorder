@@ -255,8 +255,7 @@ impl SampleGenerator {
 
         if capture_audio {
             // Create the audio generator
-            let mut temp_audio_generator = CaptureAudioGenerator::new(audio_source, 0)?;
-            println!("created capture audio gen");
+            audio_generator = Some(CaptureAudioGenerator::new(audio_source)?);
             // Start capture and wait for initialization with 500ms timeout
             /*audio_processor = Some(AudioProcessor::new(
                 audio_input_format,
@@ -317,7 +316,6 @@ impl SampleGenerator {
         let audio_sample = if let Some(generator) = &mut self.audio_generator {
             generator.try_get_audio_sample()
         } else {
-            println!("returning none");
             None
         };
         println!("got audio sample");
@@ -337,7 +335,6 @@ impl SampleGenerator {
         
         // If we didn't have both, check for individual sources
         if let Some(audio) = audio_sample {
-            println!(" we have audio");
             // Only system audio available
             return Ok(Some(self.convert_to_encoder_input(audio)?));
         }

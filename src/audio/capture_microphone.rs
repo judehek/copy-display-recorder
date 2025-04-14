@@ -178,13 +178,13 @@ unsafe fn initialize_audio_capture(audio_source: &AudioSource) -> Result<(IAudio
 }
 
 impl CaptureMicrophoneGenerator {
-    pub fn new(audio_source: AudioSource, initial_qpc: i64) -> Result<Self> {
+    pub fn new(audio_source: AudioSource) -> Result<Self> {
         // Create shared atomic variables with hard-coded values
         let sample_rate = Arc::new(AtomicU32::new(HARD_CODED_SAMPLE_RATE));
         let channels = Arc::new(AtomicU16::new(HARD_CODED_CHANNELS));
         let bits_per_sample = Arc::new(AtomicU16::new(HARD_CODED_BITS_PER_SAMPLE));
         let initialized = Arc::new(AtomicBool::new(false));
-        let start_qpc = Arc::new(AtomicI64::new(initial_qpc)); // Store as atomic
+        let start_qpc = Arc::new(AtomicI64::new(0)); // Store as atomic
         
         // Get the QPC frequency for timestamp calculations
         let mut qpf_frequency: i64 = 0;

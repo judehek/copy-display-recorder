@@ -115,10 +115,8 @@ impl AudioEncoder {
     /// For encoders, one input might not immediately produce an output due to buffering.
     pub fn process_sample(&mut self, input_sample: &AudioEncoderInputSample) -> Result<Option<AudioEncoderOutputSample>> {
         unsafe {
-            println!("start process sample");
             // Create an MF sample from the input sample
             let input_mf_sample = MFCreateSample()?;
-            println!("created sample");
             
             // Create a buffer for the input data
             let input_buffer = MFCreateMemoryBuffer(input_sample.data.len() as u32)?;
