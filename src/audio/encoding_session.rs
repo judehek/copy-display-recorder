@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{sync::{Arc, Barrier, Mutex}, time::{SystemTime, UNIX_EPOCH}};
 
 use windows::{
     core::{imp::CoTaskMemFree, ComInterface, Result, HSTRING},
@@ -15,8 +15,8 @@ use windows::{
             Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC},
             Gdi::HMONITOR,
         },
-        Media::{Audio::{IAudioClient, IMMDevice}, MediaFoundation::{
-            IMFMediaType, IMFSample, IMFSinkWriter, MFAudioFormat_AAC, MFAudioFormat_PCM, MFCreateAttributes, MFCreateMFByteStreamOnStreamEx, MFCreateSinkWriterFromURL
+        Media::{Audio::{IAudioClient, IMMDevice}, KernelStreaming::KS_TRUECOLORINFO, MediaFoundation::{
+            IMFMediaType, IMFSample, IMFSinkWriter, MFAudioFormat_AAC, MFAudioFormat_Float, MFAudioFormat_PCM, MFCreateAttributes, MFCreateMFByteStreamOnStreamEx, MFCreateSinkWriterFromURL
         }},
         System::{Com::CLSCTX_ALL, Performance::QueryPerformanceFrequency}
     },
@@ -37,7 +37,8 @@ pub enum AudioSource {
 pub struct AudioEncodingSession {
     audio_capture_session: Option<AudioCaptureSession>,
     microphone_capture_session: Option<MicrophoneCaptureSession>,
-    running: Arc<std::sync::atomic::AtomicBool>,
+    stop_signal: Arc<std::sync::atomic::AtomicBool>,
+    start_barrier: Arc<Barrier>,
     processing_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -60,7 +61,7 @@ impl AudioEncodingSession {
     pub fn new(
         encoder_device: &AudioEncoderDevice,
         bit_rate: u32,
-        sample_writer: Arc<SampleWriter>,
+        sample_writer: Arc<Mutex<SampleWriter>>,
     ) -> Result<Self> {
         // Your existing format setup code remains the same
         let output_format = AudioFormat {
@@ -83,12 +84,11 @@ impl AudioEncodingSession {
         let sample_generator = SampleGenerator::new(
             true,
             AudioSource::Desktop,
-            false, 
+            false,
             None,
             output_format.clone(),
             None,
         )?;
-        println!("created sample gen");
         
         // Store references to capture sessions
         let audio_capture_session = sample_generator.audio_capture_session().clone();
@@ -99,16 +99,19 @@ impl AudioEncodingSession {
         
         // Clone for thread
         let sample_generator_thread = sample_generator.clone();
-        let sample_writer_thread = sample_writer.clone();
         
         // Capture encoder configuration for the thread
         let encoder_device_clone = encoder_device.clone();
         let output_format_clone = output_format.clone();
         let capture_format_clone = capture_format.clone();
         
-        // Set up a flag to control the thread
-        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let running_thread = running.clone();
+        // Create a barrier for 2 threads: the main thread and the worker thread
+        let start_barrier = Arc::new(Barrier::new(2));
+        let start_barrier_thread = start_barrier.clone();
+
+        // Use a separate signal for stopping
+        let stop_signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_signal_thread = stop_signal.clone();
         
         // Create the processing thread
         let processing_thread = std::thread::spawn(move || {
@@ -116,8 +119,8 @@ impl AudioEncodingSession {
             let mut audio_encoder = match AudioEncoder::new(
                 &encoder_device_clone,
                 capture_format_clone,
-                output_format,
-                Some(bit_rate)
+                output_format_clone,
+                None
             ) {
                 Ok(encoder) => encoder,
                 Err(e) => {
@@ -125,17 +128,27 @@ impl AudioEncodingSession {
                     return; // Exit thread if encoder creation fails
                 }
             };
+            let _ = sample_writer.lock().unwrap().add_audio_stream(audio_encoder.output_media_type());
+            println!("created audio encoder");
+
+            println!("Audio thread waiting on barrier...");
+            start_barrier_thread.wait();
+            println!("Audio thread proceeding past barrier.");
             
-            while running_thread.load(std::sync::atomic::Ordering::Relaxed) {
+            while !stop_signal_thread.load(std::sync::atomic::Ordering::Relaxed) {
                 // Try to get the next sample
+                println!("loaded running thread");
                 if let Ok(mut generator) = sample_generator_thread.lock() {
+                    println!("calling generate");
                     match generator.generate() {
                         Ok(Some(sample)) => {
+                            println!("generated sample");
                             // Process the sample with the encoder (no mutex needed now)
                             match audio_encoder.process_sample(&sample) {
                                 Ok(Some(encoded_sample)) => {
                                     // Write the encoded sample
-                                    if let Err(e) = sample_writer_thread.write_audio_sample(encoded_sample.sample()) {
+                                    unsafe {println!("sample time: {:?}", encoded_sample.sample().GetSampleTime()); }
+                                    if let Err(e) = sample_writer.lock().unwrap().write_audio_sample(encoded_sample.sample()) {
                                         eprintln!("Error writing audio sample: {:?}", e);
                                     }
                                 },
@@ -160,7 +173,7 @@ impl AudioEncodingSession {
                 Ok(encoded_samples) => {
                     // Write any remaining encoded samples
                     for encoded_sample in encoded_samples {
-                        if let Err(e) = sample_writer_thread.write_audio_sample(encoded_sample.sample()) {
+                        if let Err(e) = sample_writer.lock().unwrap().write_audio_sample(encoded_sample.sample()) {
                             eprintln!("Error writing drained audio sample: {:?}", e);
                         }
                     }
@@ -172,37 +185,46 @@ impl AudioEncodingSession {
         Ok(Self {
             audio_capture_session,
             microphone_capture_session,
-            running,
+            stop_signal, // Store the stop signal
+            start_barrier, // Store the barrier
             processing_thread: Some(processing_thread),
         })
     }
 
-    pub fn start(&mut self) -> Result<()> {
+    pub fn start(&mut self, start_qpc: i64) -> Result<()> {
         // Start the capture sessions
         if let Some(session) = &mut self.audio_capture_session {
-            session.StartCapture()?;
+            session.StartCapture(start_qpc)?;
         }
         if let Some(session) = &mut self.microphone_capture_session {
-            session.StartCapture()?;
+            session.StartCapture(start_qpc)?;
         }
-        
-        // Set the running flag to true to activate the processing thread
-        self.running.store(true, std::sync::atomic::Ordering::Relaxed);
-        
+
+        // Signal the processing thread to start its loop by waiting on the barrier
+        // This call will block until the worker thread also calls wait().
+        println!("Main thread waiting on barrier...");
+        self.start_barrier.wait();
+        println!("Main thread proceeding past barrier.");
+
+        // Note: The stop_signal remains false here.
+
         Ok(())
     }
 
     pub fn stop(&mut self) -> Result<()> {
-        // Set the running flag to false to stop the processing thread
-        self.running.store(false, std::sync::atomic::Ordering::Relaxed);
-        
+        // Set the stop signal to true to stop the processing thread's loop
+        self.stop_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+        println!("Stop signal sent.");
+
         // Wait for the processing thread to finish
         if let Some(thread) = self.processing_thread.take() {
+            println!("Joining audio processing thread...");
             if let Err(e) = thread.join() {
                 eprintln!("Error joining processing thread: {:?}", e);
             }
+            println!("Audio processing thread joined.");
         }
-        
+
         // Stop the capture sessions
         if let Some(session) = &mut self.audio_capture_session {
             session.StopCapture()?;
@@ -210,7 +232,7 @@ impl AudioEncodingSession {
         if let Some(session) = &mut self.microphone_capture_session {
             session.StopCapture()?;
         }
-        
+
         Ok(())
     }
 }
@@ -236,18 +258,6 @@ impl SampleGenerator {
             let mut temp_audio_generator = CaptureAudioGenerator::new(audio_source, 0)?;
             println!("created capture audio gen");
             // Start capture and wait for initialization with 500ms timeout
-            temp_audio_generator.start_capture_and_wait(500)?;
-            
-            // Create the audio processor with the audio format from the generator
-            let audio_input_format = AudioFormat {
-                sample_rate: temp_audio_generator.get_sample_rate(),
-                channels: temp_audio_generator.get_channels(),
-                bits_per_sample: temp_audio_generator.get_bits_per_sample(),
-                channel_mask: None,
-                format: MFAudioFormat_PCM,
-            };
-            
-            audio_generator = Some(temp_audio_generator);
             /*audio_processor = Some(AudioProcessor::new(
                 audio_input_format,
                 output_format.clone(),
@@ -307,31 +317,36 @@ impl SampleGenerator {
         let audio_sample = if let Some(generator) = &mut self.audio_generator {
             generator.try_get_audio_sample()
         } else {
+            println!("returning none");
             None
         };
+        println!("got audio sample");
         
-        let mic_sample = if let Some(generator) = &mut self.microphone_generator {
+        /*let mic_sample = if let Some(generator) = &mut self.microphone_generator {
             generator.try_get_audio_sample()
         } else {
             None
-        };
+        };*/
         
         // Check if we have both audio and mic samples
-        if let (Some(audio), Some(mic)) = (&audio_sample, &mic_sample) {
+        /*if let (Some(audio), Some(mic)) = (&audio_sample, &mic_sample) {
             // Both sources available, mix them
+            println!("we have both");
             return Ok(Some(self.mix_audio_samples(audio.clone(), mic.clone())?));
-        }
+        }*/
         
         // If we didn't have both, check for individual sources
         if let Some(audio) = audio_sample {
+            println!(" we have audio");
             // Only system audio available
             return Ok(Some(self.convert_to_encoder_input(audio)?));
         }
         
-        if let Some(mic) = mic_sample {
+        /*if let Some(mic) = mic_sample {
+            println!("we have mic");
             // Only microphone audio available
             return Ok(Some(self.convert_to_encoder_input(mic)?));
-        }
+        }*/
         
         // No samples available
         Ok(None)
@@ -427,21 +442,4 @@ impl SampleGenerator {
         ))
     }
     
-}
-
-const CLEAR_COLOR: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
-
-fn ensure_even(value: i32) -> i32 {
-    if value % 2 == 0 {
-        value
-    } else {
-        value + 1
-    }
-}
-
-fn ensure_even_size(size: SizeInt32) -> SizeInt32 {
-    SizeInt32 {
-        Width: ensure_even(size.Width),
-        Height: ensure_even(size.Height),
-    }
 }

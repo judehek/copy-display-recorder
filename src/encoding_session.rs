@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use windows::{
     core::{Result, HSTRING},
     Foundation::TimeSpan,
@@ -12,7 +12,7 @@ use windows::{
         Media::MediaFoundation::{
             IMFMediaType, IMFSample, IMFSinkWriter, 
             MFCreateAttributes, MFCreateMFByteStreamOnStreamEx, MFCreateSinkWriterFromURL
-        },
+        }, System::Performance::QueryPerformanceCounter,
     },
 };
 
@@ -26,7 +26,7 @@ use crate::{
 pub struct MediaEncodingSession {
     video_session: VideoEncodingSession,
     audio_session: AudioEncodingSession,
-    sample_writer: Arc<SampleWriter>,
+    sample_writer: Arc<Mutex<SampleWriter>>,
 }
 
 pub struct SampleWriter {
@@ -102,7 +102,7 @@ impl SampleWriter {
 
     pub fn write_audio_sample(&self, sample: &IMFSample) -> Result<()> {
         if let Some(stream_index) = self.audio_stream_index {
-            unsafe { 
+            unsafe {
                 self.sink_writer.WriteSample(stream_index, sample)
             }
         } else {
@@ -124,7 +124,7 @@ impl MediaEncodingSession {
         stream: IRandomAccessStream,
     ) -> Result<Self> {
         // Create the shared sink writer
-        let sample_writer = Arc::new(SampleWriter::new(stream)?);
+        let sample_writer = Arc::new(Mutex::new(SampleWriter::new(stream)?));
         
         // Create video session with shared sink writer
         let video_session = VideoEncodingSession::new(
@@ -144,7 +144,6 @@ impl MediaEncodingSession {
             audio_bit_rate,
             sample_writer.clone(),
         )?;
-        println!("created audio encoder");
         
         Ok(Self {
             video_session,
@@ -155,11 +154,15 @@ impl MediaEncodingSession {
     
     pub fn start(&mut self) -> Result<()> {
         // Start the sink writer first
-        self.sample_writer.start()?;
+        self.sample_writer.lock().unwrap().start()?;
+
+        let mut start_qpc = 0;
+        unsafe { QueryPerformanceCounter(&mut start_qpc)? };
+        println!("Obtained start QPC: {}", start_qpc);
         
         // Start both encoding sessions
-        self.audio_session.start()?;
-        self.video_session.start()?;
+        self.audio_session.start(start_qpc)?;
+        self.video_session.start(start_qpc)?;
         
         Ok(())
     }
@@ -170,7 +173,7 @@ impl MediaEncodingSession {
         self.audio_session.stop()?;
         
         // Finally stop the sink writer
-        self.sample_writer.stop()?;
+        self.sample_writer.lock().unwrap().stop()?;
         
         Ok(())
     }

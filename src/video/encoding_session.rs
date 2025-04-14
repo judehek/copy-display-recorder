@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::{SystemTime, UNIX_EPOCH}};
+use std::{sync::{Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
 
 use windows::{
     core::{Result, HSTRING},
@@ -61,7 +61,7 @@ impl VideoEncodingSession {
         resolution: SizeInt32,
         bit_rate: u32,
         frame_rate: u32,
-        sample_writer: Arc<SampleWriter>,
+        sample_writer: Arc<Mutex<SampleWriter>>,
     ) -> Result<Self> {
         let input_size = ensure_even_size(resolution);
         let output_size = ensure_even_size(resolution);
@@ -74,6 +74,7 @@ impl VideoEncodingSession {
             bit_rate,
             frame_rate,
         )?;
+        let output_type = video_encoder.output_type().clone();
 
         let mut sample_generator = SampleGenerator::new(
             d3d_device, 
@@ -87,9 +88,11 @@ impl VideoEncodingSession {
             move || -> Result<Option<VideoEncoderInputSample>> { sample_generator.generate() },
         );
 
+        // set output type
+        sample_writer.lock().unwrap().add_video_stream(&output_type);
         video_encoder.set_sample_rendered_callback({
             let sample_writer = sample_writer.clone();
-            move |sample| -> Result<()> { sample_writer.write_video_sample(sample.sample()) }
+            move |sample| -> Result<()> { sample_writer.lock().unwrap().write_video_sample(sample.sample()) }
         });
 
         Ok(Self {
@@ -98,8 +101,8 @@ impl VideoEncodingSession {
         })
     }
 
-    pub fn start(&mut self) -> Result<()> {
-        self.capture_session.StartCapture()?;
+    pub fn start(&mut self, start_qpc: i64) -> Result<()> {
+        self.capture_session.StartCapture(start_qpc)?;
         assert!(self.video_encoder.try_start()?);
         Ok(())
     }

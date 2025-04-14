@@ -1,6 +1,8 @@
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use windows::Foundation::TimeSpan;
 use windows::Win32::System::Performance::QueryPerformanceCounter;
@@ -61,21 +63,21 @@ pub struct AcquiredFrame {
 
 // Mimics GraphicsCaptureSession from the Windows API
 pub struct CustomGraphicsCaptureSession {
-    sender: Sender<bool>, // To signal start/stop
+    sender: Sender<(bool, i64)>, // Modified to include QPC timestamp
     running: bool,
 }
 
 impl CustomGraphicsCaptureSession {
-    fn new(sender: Sender<bool>) -> Self {
+    fn new(sender: Sender<(bool, i64)>) -> Self {
         Self {
             sender,
             running: false,
         }
     }
 
-    pub fn StartCapture(&mut self) -> Result<()> {
+    pub fn StartCapture(&mut self, start_qpc: i64) -> Result<()> {
         if !self.running {
-            self.sender.send(true).map_err(|_| windows::core::Error::from(E_FAIL))?;
+            self.sender.send((true, start_qpc)).map_err(|_| windows::core::Error::from(E_FAIL))?;
             self.running = true;
         }
         Ok(())
@@ -83,7 +85,7 @@ impl CustomGraphicsCaptureSession {
 
     pub fn Close(&mut self) -> Result<()> {
         if self.running {
-            self.sender.send(false).map_err(|_| windows::core::Error::from(E_FAIL))?;
+            self.sender.send((false, 0)).map_err(|_| windows::core::Error::from(E_FAIL))?;
             self.running = false;
         }
         Ok(())
@@ -104,6 +106,7 @@ pub struct CaptureFrameGenerator {
     sender: Sender<Option<AcquiredFrame>>,
     receiver: Receiver<Option<AcquiredFrame>>,
     session: CustomGraphicsCaptureSession,
+    start_qpc: Arc<AtomicI64>,  // Added to store the reference QPC value
 }
 
 impl CaptureFrameGenerator {
@@ -116,6 +119,10 @@ impl CaptureFrameGenerator {
         let (control_sender, control_receiver) = channel();
 
         let frame_sender_for_struct = frame_sender.clone();
+        
+        // Create atomic for storing the start QPC timestamp
+        let start_qpc = Arc::new(AtomicI64::new(0));
+        let thread_start_qpc = start_qpc.clone();
         
         // Create session
         let session = CustomGraphicsCaptureSession::new(control_sender.clone());
@@ -140,8 +147,15 @@ impl CaptureFrameGenerator {
             'outer: loop {
                 // Check for control messages first
                 match control_receiver.try_recv() {
-                    Ok(start_signal) => {
+                    Ok((start_signal, new_qpc)) => {
                         running = start_signal;
+                        
+                        if running {
+                            // Update the start QPC value when starting capture
+                            thread_start_qpc.store(new_qpc, Ordering::SeqCst);
+                            println!("Video capture: Updated start_qpc to: {}", new_qpc);
+                        }
+                        
                         if !running {
                             // Signal end of capture
                             let _ = frame_sender.send(None);
@@ -240,13 +254,20 @@ impl CaptureFrameGenerator {
                         }
                         
                         // Get our own QPC timestamp
-                        let present_time = match get_qpc_timestamp() {
+                        let qpc_timestamp = match get_raw_qpc_timestamp() {
                             Ok(timestamp) => timestamp,
                             Err(e) => {
                                 eprintln!("Failed to get QPC timestamp: {:?}", e);
                                 continue;
                             }
                         };
+                        
+                        // Get the current reference QPC value 
+                        let current_start_qpc = thread_start_qpc.load(Ordering::SeqCst);
+                        
+                        // Create a relative timestamp based on the start_qpc
+                        let relative_timestamp = qpc_timestamp - current_start_qpc;
+                        let present_time = TimeSpan { Duration: relative_timestamp };
                         
                         // Create and send the frame
                         let frame = AcquiredFrame {
@@ -266,7 +287,7 @@ impl CaptureFrameGenerator {
                         // No new frame available - use last frame with a new timestamp if we have one
                         if let Some(last_tex) = &last_texture {
                             // Get a new QPC timestamp
-                            let present_time = match get_qpc_timestamp() {
+                            let qpc_timestamp = match get_raw_qpc_timestamp() {
                                 Ok(timestamp) => timestamp,
                                 Err(e) => {
                                     eprintln!("Failed to get QPC timestamp for duplicate frame: {:?}", e);
@@ -274,6 +295,11 @@ impl CaptureFrameGenerator {
                                     continue;
                                 }
                             };
+                            
+                            // Calculate relative timestamp
+                            let current_start_qpc = thread_start_qpc.load(Ordering::SeqCst);
+                            let relative_timestamp = qpc_timestamp - current_start_qpc;
+                            let present_time = TimeSpan { Duration: relative_timestamp };
                             
                             // Create a duplicate frame with the new timestamp
                             let frame = AcquiredFrame {
@@ -311,11 +337,17 @@ impl CaptureFrameGenerator {
             sender: frame_sender_for_struct,
             receiver: frame_receiver,
             session,
+            start_qpc,
         })
     }
 
     pub fn session(&self) -> &CustomGraphicsCaptureSession {
         &self.session
+    }
+
+    // Convenience method to start capture with the given QPC
+    pub fn start_capture(&mut self, start_qpc: i64) -> Result<()> {
+        self.session.StartCapture(start_qpc)
     }
 
     // Simplified function that just receives from the channel
@@ -338,13 +370,25 @@ impl CaptureFrameGenerator {
     pub fn stop_capture(&mut self) -> Result<()> {
         self.session.Close()
     }
+    
+    // Getter for the current start_qpc value
+    pub fn get_start_qpc(&self) -> i64 {
+        self.start_qpc.load(Ordering::SeqCst)
+    }
 }
 
-fn get_qpc_timestamp() -> Result<TimeSpan> {
+// Modified to return raw QPC value without creating TimeSpan
+fn get_raw_qpc_timestamp() -> Result<i64> {
     let mut qpc_timestamp: i64 = 0;
     unsafe {
         QueryPerformanceCounter(&mut qpc_timestamp)?;
     }
+    Ok(qpc_timestamp)
+}
+
+// Original function kept for backward compatibility
+fn get_qpc_timestamp() -> Result<TimeSpan> {
+    let qpc_timestamp = get_raw_qpc_timestamp()?;
     
     // Create a TimeSpan using the same pattern as your example
     let timestamp = TimeSpan {

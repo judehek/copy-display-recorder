@@ -5,7 +5,7 @@ use ringbuf::traits::{Consumer, Observer};
 use ringbuf::wrap::caching::Caching;
 use windows::Foundation::TimeSpan;
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
+use windows::Win32::Media::KernelStreaming::{KSDATAFORMAT_SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE};
 use windows::Win32::Media::Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
 use windows::Win32::System::Performance::QueryPerformanceFrequency;
 use windows::{
@@ -26,7 +26,7 @@ use windows::{
 
 use ringbuf::{HeapRb, producer::Producer, traits::Split};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU16, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU16, AtomicBool, AtomicI64, Ordering};
 
 use super::encoding_session::AudioSource;
 
@@ -37,7 +37,7 @@ const REFTIMES_PER_MILLISEC: i64 = 10000; // 100ns units per millisecond
 // Hard-coded audio format constants
 const HARD_CODED_SAMPLE_RATE: u32 = 48000;
 const HARD_CODED_CHANNELS: u16 = 2;
-const HARD_CODED_BITS_PER_SAMPLE: u16 = 32;  // 32-bit float
+const HARD_CODED_BITS_PER_SAMPLE: u16 = 16;  // 32-bit float
 
 pub struct AudioSample {
     pub data: Vec<u8>,
@@ -47,21 +47,21 @@ pub struct AudioSample {
 }
 
 pub struct AudioCaptureSession {
-    sender: Sender<bool>, // To signal start/stop
+    sender: Sender<(bool, i64)>, // Modified to include QPC timestamp
     running: bool,
 }
 
 impl AudioCaptureSession {
-    fn new(sender: Sender<bool>) -> Self {
+    fn new(sender: Sender<(bool, i64)>) -> Self {
         Self {
             sender,
             running: false,
         }
     }
 
-    pub fn StartCapture(&mut self) -> Result<()> {
+    pub fn StartCapture(&mut self, start_qpc: i64) -> Result<()> {
         if !self.running {
-            self.sender.send(true).map_err(|_| windows::core::Error::from(E_FAIL))?;
+            self.sender.send((true, start_qpc)).map_err(|_| windows::core::Error::from(E_FAIL))?;
             self.running = true;
         }
         Ok(())
@@ -69,7 +69,7 @@ impl AudioCaptureSession {
 
     pub fn StopCapture(&mut self) -> Result<()> {
         if self.running {
-            self.sender.send(false).map_err(|_| windows::core::Error::from(E_FAIL))?;
+            self.sender.send((false, 0)).map_err(|_| windows::core::Error::from(E_FAIL))?;
             self.running = false;
         }
         Ok(())
@@ -92,7 +92,7 @@ pub struct CaptureAudioGenerator {
     channels: Arc<AtomicU16>,
     bits_per_sample: Arc<AtomicU16>,
     initialized: Arc<AtomicBool>,
-    start_qpc: i64,
+    start_qpc: Arc<AtomicI64>, // Changed to atomic for thread safety
     qpf_frequency: i64,
 }
 
@@ -114,8 +114,8 @@ unsafe fn create_hardcoded_wave_format() -> WAVEFORMATEXTENSIBLE {
     format.Samples.wValidBitsPerSample = HARD_CODED_BITS_PER_SAMPLE;
     format.dwChannelMask = 3; // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT
     
-    // Set the SubFormat to IEEE_FLOAT
-    format.SubFormat = KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    // Set the SubFormat to PCM instead of IEEE_FLOAT
+    format.SubFormat = KSDATAFORMAT_SUBTYPE_PCM;
     
     format
 }
@@ -183,12 +183,13 @@ unsafe fn initialize_audio_capture(audio_source: &AudioSource) -> Result<(IAudio
 }
 
 impl CaptureAudioGenerator {
-    pub fn new(audio_source: AudioSource, start_qpc: i64) -> Result<Self> {
+    pub fn new(audio_source: AudioSource, initial_qpc: i64) -> Result<Self> {
         // Create shared atomic variables with hard-coded values
         let sample_rate = Arc::new(AtomicU32::new(HARD_CODED_SAMPLE_RATE));
         let channels = Arc::new(AtomicU16::new(HARD_CODED_CHANNELS));
         let bits_per_sample = Arc::new(AtomicU16::new(HARD_CODED_BITS_PER_SAMPLE));
         let initialized = Arc::new(AtomicBool::new(false));
+        let start_qpc = Arc::new(AtomicI64::new(initial_qpc)); // Store as atomic
         
         // Get the QPC frequency for timestamp calculations
         let mut qpf_frequency: i64 = 0;
@@ -204,7 +205,7 @@ impl CaptureAudioGenerator {
         let rb = HeapRb::<AudioSample>::new(buffer_size);
         let (mut producer, consumer) = rb.split();
         
-        // Create control channel
+        // Create control channel - now sends bool and i64
         let (control_sender, control_receiver) = channel();
         
         // Clone references for the thread
@@ -213,7 +214,7 @@ impl CaptureAudioGenerator {
         let thread_channels = channels.clone();
         let thread_bits_per_sample = bits_per_sample.clone();
         let thread_initialized = initialized.clone();
-        let thread_start_qpc = start_qpc;
+        let thread_start_qpc = start_qpc.clone();
         let thread_qpf_frequency = qpf_frequency;
 
         // Create session object
@@ -238,26 +239,32 @@ impl CaptureAudioGenerator {
                 'outer: loop {
                     // Check for control messages first
                     match control_receiver.try_recv() {
-                        Ok(start_signal) => {
+                        Ok((start_signal, new_qpc)) => {
                             running = start_signal;
                             
-                            if running && audio_client.is_none() {
-                                // Initialize audio capture using our helper function
-                                match initialize_audio_capture(&thread_audio_source) {
-                                    Ok((client, capture_client, handle, actual_sample_rate, actual_channels, actual_bits_per_sample)) => {
-                                        // Store the actual format info
-                                        thread_sample_rate.store(actual_sample_rate, Ordering::SeqCst);
-                                        thread_channels.store(actual_channels, Ordering::SeqCst);
-                                        thread_bits_per_sample.store(actual_bits_per_sample, Ordering::SeqCst);
-                                        thread_initialized.store(true, Ordering::SeqCst);
-                                        
-                                        audio_client = Some(client);
-                                        audio_capture_client = Some(capture_client);
-                                        event_handle = Some(handle);
-                                    },
-                                    Err(e) => {
-                                        eprintln!("Failed to initialize audio capture: {:?}", e);
-                                        break;
+                            if running {
+                                // Update the start_qpc with the new value from StartCapture
+                                thread_start_qpc.store(new_qpc, Ordering::SeqCst);
+                                println!("Updated start_qpc to: {}", new_qpc);
+                                
+                                if audio_client.is_none() {
+                                    // Initialize audio capture using our helper function
+                                    match initialize_audio_capture(&thread_audio_source) {
+                                        Ok((client, capture_client, handle, actual_sample_rate, actual_channels, actual_bits_per_sample)) => {
+                                            // Store the actual format info
+                                            thread_sample_rate.store(actual_sample_rate, Ordering::SeqCst);
+                                            thread_channels.store(actual_channels, Ordering::SeqCst);
+                                            thread_bits_per_sample.store(actual_bits_per_sample, Ordering::SeqCst);
+                                            thread_initialized.store(true, Ordering::SeqCst);
+                                            
+                                            audio_client = Some(client);
+                                            audio_capture_client = Some(capture_client);
+                                            event_handle = Some(handle);
+                                        },
+                                        Err(e) => {
+                                            eprintln!("Failed to initialize audio capture: {:?}", e);
+                                            break;
+                                        }
                                     }
                                 }
                             } else if !running && audio_client.is_some() {
@@ -322,10 +329,12 @@ impl CaptureAudioGenerator {
                                     buffer_size_bytes
                                 );
                                 
-                                // Calculate timestamp and duration
-                                // Convert QPC timestamp to relative time in 100ns units
+                                // Get the current start_qpc value dynamically
+                                let current_start_qpc = thread_start_qpc.load(Ordering::SeqCst);
+                                
+                                // Calculate timestamp and duration using the dynamically updated start_qpc
                                 let qpc_signed = qpc_position as i64;
-                                let relative_timestamp_hns = ((qpc_signed - thread_start_qpc) * REFTIMES_PER_SEC) / thread_qpf_frequency;
+                                let relative_timestamp_hns = ((qpc_signed - current_start_qpc) * REFTIMES_PER_SEC) / thread_qpf_frequency;
                                 let packet_duration_hns = (num_frames_available as i64 * REFTIMES_PER_SEC) / current_sample_rate as i64;
                                 
                                 // Create TimeSpan objects
@@ -381,28 +390,6 @@ impl CaptureAudioGenerator {
         })
     }
     
-    // Wait until initialization completes
-    pub fn wait_for_initialization(&self, timeout_ms: u64) -> Result<()> {
-        let start = std::time::Instant::now();
-        while !self.initialized.load(Ordering::SeqCst) {
-            // Check for timeout
-            if start.elapsed() > std::time::Duration::from_millis(timeout_ms) {
-                return Err(windows::core::Error::from(E_FAIL));
-            }
-            
-            // Sleep to avoid spinning
-            thread::sleep(std::time::Duration::from_millis(10));
-        }
-        
-        Ok(())
-    }
-    
-    // Convenience method that starts capture and can wait for initialization
-    pub fn start_capture_and_wait(&mut self, timeout_ms: u64) -> Result<()> {
-        self.session.StartCapture()?;
-        self.wait_for_initialization(timeout_ms)
-    }
-    
     pub fn session(&self) -> &AudioCaptureSession {
         &self.session
     }
@@ -440,7 +427,14 @@ impl CaptureAudioGenerator {
     
     // Method to calculate time from QPC value
     pub fn qpc_to_time(&self, qpc: i64) -> TimeSpan {
-        let relative_time_hns = ((qpc - self.start_qpc) * REFTIMES_PER_SEC) / self.qpf_frequency;
+        // Use the current start_qpc value
+        let current_start_qpc = self.start_qpc.load(Ordering::SeqCst);
+        let relative_time_hns = ((qpc - current_start_qpc) * REFTIMES_PER_SEC) / self.qpf_frequency;
         TimeSpan { Duration: relative_time_hns }
+    }
+    
+    // Getter for the current start_qpc value
+    pub fn get_start_qpc(&self) -> i64 {
+        self.start_qpc.load(Ordering::SeqCst)
     }
 }

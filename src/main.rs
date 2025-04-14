@@ -92,7 +92,7 @@ fn run(
     }
 
     // TODO: get display handle by window (game) rather than index
-    let display_handle = get_display_handle_from_index(display_index)
+    let monitor_handle = get_display_handle_from_index(display_index)
         .expect("The provided display index was out of bounds!");
 
     let d3d_device = create_d3d_device()?;
@@ -171,7 +171,7 @@ fn run(
         // d3d_device created earlier
         let mut session = create_encoding_session(
             d3d_device,
-            display_handle,
+            monitor_handle,
             video_encoder_device,
             audio_encoder_device,
             resolution,

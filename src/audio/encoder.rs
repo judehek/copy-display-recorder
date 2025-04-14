@@ -115,8 +115,10 @@ impl AudioEncoder {
     /// For encoders, one input might not immediately produce an output due to buffering.
     pub fn process_sample(&mut self, input_sample: &AudioEncoderInputSample) -> Result<Option<AudioEncoderOutputSample>> {
         unsafe {
+            println!("start process sample");
             // Create an MF sample from the input sample
             let input_mf_sample = MFCreateSample()?;
+            println!("created sample");
             
             // Create a buffer for the input data
             let input_buffer = MFCreateMemoryBuffer(input_sample.data.len() as u32)?;
@@ -160,6 +162,7 @@ impl AudioEncoder {
             // Try to create a buffer of the suggested size - encoders often need larger buffers
             let buffer_size = self.output_buffer_size;
             let output_buffer = MFCreateMemoryBuffer(buffer_size)?;
+            println!("output buffer");
             
             let output_sample = MFCreateSample()?;
             output_sample.AddBuffer(&output_buffer)?;
@@ -181,6 +184,7 @@ impl AudioEncoder {
                 &mut process_output_status, // Status flags
             ) {
                 Ok(_) => {
+                    println!("test");
                     // Success! We got an output sample.
                     let filled_sample_option = ManuallyDrop::take(&mut output_buffers[0].pSample);
                     
@@ -415,12 +419,6 @@ fn create_aac_output_media_type(
         
         // Set bitrate (bytes per second = bits per second / 8)
         media_type.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bitrate_value / 8)?;
-        
-        // Set block alignment (not always required for AAC, but good practice)
-        let block_align = format.block_align() as u32;
-        if block_align > 0 {
-            media_type.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, block_align)?;
-        }
         
         // Set AAC-specific attributes
         
