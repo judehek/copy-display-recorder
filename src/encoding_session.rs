@@ -10,7 +10,7 @@ use windows::{
             Gdi::HMONITOR,
         },
         Media::MediaFoundation::{
-            IMFMediaType, IMFSample, IMFSinkWriter, 
+            IMFMediaType, IMFSample, IMFSinkWriter, MF_SINK_WRITER_DISABLE_THROTTLING,
             MFCreateAttributes, MFCreateMFByteStreamOnStreamEx, MFCreateSinkWriterFromURL
         }, System::Performance::QueryPerformanceCounter,
     },
@@ -40,15 +40,20 @@ unsafe impl Send for SampleWriter {}
 unsafe impl Sync for SampleWriter {}
 impl SampleWriter {
     pub fn new(stream: IRandomAccessStream) -> Result<Self> {
-        let empty_attributes = unsafe {
+        let attributes = unsafe {
             let mut attributes = None;
-            MFCreateAttributes(&mut attributes, 0)?;
-            attributes.unwrap()
+            MFCreateAttributes(&mut attributes, 1)?;
+            let attributes = attributes.unwrap();
+            
+            // Set the disable throttling attribute to TRUE
+            attributes.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1)?;
+            
+            attributes
         };
         
         let sink_writer = unsafe {
             let byte_stream = MFCreateMFByteStreamOnStreamEx(&stream)?;
-            MFCreateSinkWriterFromURL(&HSTRING::from(".mp4"), &byte_stream, &empty_attributes)?
+            MFCreateSinkWriterFromURL(&HSTRING::from(".mp4"), &byte_stream, &attributes)?
         };
 
         Ok(Self {
