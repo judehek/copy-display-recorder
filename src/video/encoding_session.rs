@@ -92,7 +92,16 @@ impl VideoEncodingSession {
         sample_writer.lock().unwrap().add_video_stream(&output_type);
         video_encoder.set_sample_rendered_callback({
             let sample_writer = sample_writer.clone();
-            move |sample| -> Result<()> { sample_writer.lock().unwrap().write_video_sample(sample.sample()) }
+            move |mut output_sample| -> Result<()> {
+                // Write the sample and remove its buffers
+                {
+                    let writer = sample_writer.lock().unwrap();
+                    writer.write_video_sample(output_sample.sample())?;
+                }
+                // Explicitly drop the sample to force COM Release
+                drop(output_sample);
+                Ok(())
+            }
         });
 
         Ok(Self {

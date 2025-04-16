@@ -143,11 +143,15 @@ impl AudioEncodingSession {
                             // Process the sample with the encoder (no mutex needed now)
                             match audio_encoder.process_sample(&sample) {
                                 Ok(Some(encoded_sample)) => {
-                                    // Write the encoded sample
-                                    //unsafe {println!("sample time: {:?}", encoded_sample.sample().GetSampleTime()); }
-                                    if let Err(e) = sample_writer.lock().unwrap().write_audio_sample(encoded_sample.sample()) {
-                                        eprintln!("Error writing audio sample: {:?}", e);
+                                    // Write the encoded sample and remove buffers
+                                    {
+                                        let writer = sample_writer.lock().unwrap();
+                                        if let Err(e) = writer.write_audio_sample(encoded_sample.sample()) {
+                                            eprintln!("Error writing audio sample: {:?}", e);
+                                        }
                                     }
+                                    // Explicitly drop the sample to force COM Release
+                                    drop(encoded_sample);
                                 },
                                 Ok(None) => {
                                     // No encoded sample was produced, perhaps buffering
@@ -170,9 +174,15 @@ impl AudioEncodingSession {
                 Ok(encoded_samples) => {
                     // Write any remaining encoded samples
                     for encoded_sample in encoded_samples {
-                        if let Err(e) = sample_writer.lock().unwrap().write_audio_sample(encoded_sample.sample()) {
-                            eprintln!("Error writing drained audio sample: {:?}", e);
+                        // Write the drained encoded sample and remove buffers
+                        {
+                            let writer = sample_writer.lock().unwrap();
+                            if let Err(e) = writer.write_audio_sample(encoded_sample.sample()) {
+                                eprintln!("Error writing drained audio sample: {:?}", e);
+                            }
                         }
+                        // Explicitly drop the sample to force COM Release
+                        drop(encoded_sample);
                     }
                 },
                 Err(e) => eprintln!("Error draining audio encoder: {:?}", e),
