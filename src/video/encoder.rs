@@ -375,10 +375,14 @@ impl VideoEncoderInner {
                 };
                 let mf_sample = unsafe { MFCreateSample()? };
                 unsafe {
+                    // Add the DXGI surface buffer to the sample
                     mf_sample.AddBuffer(&input_buffer)?;
+                    // Set the sample timestamp
                     mf_sample.SetSampleTime(sample.timestamp.Duration)?;
-                    self.transform
-                        .ProcessInput(self.input_stream_id, &mf_sample, 0)?;
+                    // Submit the sample to the transform
+                    self.transform.ProcessInput(self.input_stream_id, &mf_sample, 0)?;
+                    // Release all buffers from the sample to free associated memory
+                    mf_sample.RemoveAllBuffers()?;
                 };
                 should_exit = false;
             }

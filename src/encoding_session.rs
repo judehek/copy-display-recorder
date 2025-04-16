@@ -95,21 +95,31 @@ impl SampleWriter {
         unsafe { self.sink_writer.Finalize() }
     }
 
+    /// Write a video sample to the sink writer and release its buffers to avoid leaks.
     pub fn write_video_sample(&self, sample: &IMFSample) -> Result<()> {
         if let Some(stream_index) = self.video_stream_index {
-            unsafe { 
-                self.sink_writer.WriteSample(stream_index, sample)
+            unsafe {
+                // Write the sample to the sink writer
+                self.sink_writer.WriteSample(stream_index, sample)?;
+                // Remove all buffers from the sample to free associated memory
+                sample.RemoveAllBuffers()?;
             }
+            Ok(())
         } else {
             Err(windows::core::Error::from_win32())
         }
     }
 
+    /// Write an audio sample to the sink writer and release its buffers to avoid leaks.
     pub fn write_audio_sample(&self, sample: &IMFSample) -> Result<()> {
         if let Some(stream_index) = self.audio_stream_index {
             unsafe {
-                self.sink_writer.WriteSample(stream_index, sample)
+                // Write the sample to the sink writer
+                self.sink_writer.WriteSample(stream_index, sample)?;
+                // Remove all buffers from the sample to free associated memory
+                sample.RemoveAllBuffers()?;
             }
+            Ok(())
         } else {
             Err(windows::core::Error::from_win32())
         }
